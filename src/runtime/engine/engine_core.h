@@ -1489,7 +1489,8 @@ private:
                                            request->deadline.time_since_epoch())
                                            .count());
         return resources_.inspect(*instance_.program, request->prompt, *request->base_plan,
-                                  request->publication_order, allowance);
+                                  request->publication_order, allowance,
+                                  !request->force_plain_prefill);
     }
 
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
@@ -1799,7 +1800,70 @@ private:
             const ActiveAdmissionSet active =
                 scheduler_.active_admission_set(slots_, max_concurrency_);
             if (active.size == 0) {
-                throw std::logic_error("isolated-feasible request is blocked in an idle Engine");
+                // An idle engine cannot unblock a deferred head by waiting: demand evidence
+                // only accrues from completed requests. Fail this admission cleanly and let
+                // the retry re-plan from scratch (the stale cached base plan binds to cache
+                // state that recovery just cleared). A single bad admission must never
+                // accumulate worker recoveries into a global fail-all.
+                const bool stale_program_state =
+                    instance_.program->has_context_transaction() ||
+                    instance_.program->has_pending_transaction() ||
+                    instance_.program->has_unsettled_state_fork();
+                const bool lane_debris = instance_.program->has_idle_lane_debris();
+                if (stale_program_state || lane_debris || !head->force_plain_prefill) {
+                    // An idle engine cannot unblock a deferred head by waiting. Two stale
+                    // states can hold admission hostage with nothing running: an abandoned
+                    // open context transaction (e.g. client disconnect mid-materialization)
+                    // and a policy deferral that needs demand evidence only completed
+                    // requests can produce. Clear the first via the recovery path; for the
+                    // second, downgrade to a plain no-reuse admission and serve cold.
+                    std::fprintf(stderr,
+                                 "[engine] ADMISSION-DEFERRED: head=%llu readiness=%u active=0 "
+                                 "debug={%s %s txn=%u pend=%u fork=%u debris=%u} — %s\n",
+                                 static_cast<unsigned long long>(head->id),
+                                 static_cast<unsigned>(head_inspection->readiness),
+                                 resources_.admission_debug_snapshot().c_str(),
+                                 instance_.program->debug_host_kv_occupancy().c_str(),
+                                 instance_.program->has_context_transaction() ? 1U : 0U,
+                                 instance_.program->has_pending_transaction() ? 1U : 0U,
+                                 instance_.program->has_unsettled_state_fork() ? 1U : 0U,
+                                 lane_debris ? 1U : 0U,
+                                 lane_debris ? "clearing idle lane debris"
+                                            : stale_program_state
+                                                  ? "clearing stale program state"
+                                                  : "downgrading to plain prefill");
+                    if (lane_debris) {
+                        // Light clear: releases the lane binding/lifecycle without wiping the
+                        // cache catalogs (unlike the full recovery path).
+                        instance_.program->clear_idle_lanes();
+                        control_progress = true;
+                        continue;
+                    }
+                    if (stale_program_state) {
+                        recover_from_oom_locked(std::exception_ptr{});
+                        control_progress = true;
+                        continue;
+                    }
+                    head->force_plain_prefill = true;
+                    head->base_plan.reset();
+                    control_progress = true;
+                    continue;
+                }
+                std::fprintf(stderr,
+                             "[engine] ADMISSION-DEFERRED: head=%llu readiness=%u active=0 "
+                             "debug={%s %s program_txn=%u} — still deferred after plain "
+                             "downgrade, failing\n",
+                             static_cast<unsigned long long>(head->id),
+                             static_cast<unsigned>(head_inspection->readiness),
+                             resources_.admission_debug_snapshot().c_str(),
+                             instance_.program->debug_host_kv_occupancy().c_str(),
+                             instance_.program->has_context_transaction() ? 1U : 0U);
+                (void)remove_pending_error(
+                    head, std::make_exception_ptr(RequestError(
+                              RequestErrorKind::Overloaded,
+                              "admission deferred in idle engine even without cache reuse")));
+                control_progress = true;
+                continue;
             }
             if (!scheduler_.protect_blocked_head(head->id, active.span(),
                                                  instance_.program->resource_revision())) {
@@ -2040,6 +2104,15 @@ private:
         if (materializing_request != nullptr) {
             force_complete_error(materializing_request, error);
         }
+        // Pending FIFO requests may hold cached base plans bound to cache state that the
+        // cleanup just cleared; reset them so re-admission re-plans from scratch instead of
+        // re-deriving the same blocked admission forever.
+        try {
+            std::lock_guard lock(queue_mutex_);
+            for (const auto& request : pending_) {
+                if (request) { request->base_plan.reset(); }
+            }
+        } catch (...) {}
         // Slots were just freed while the worker keeps running: re-arm admission so the still-pending
         // FIFO requests are re-inspected on the next boundary without waiting for a new submission.
         request_admission_check();
@@ -2194,7 +2267,8 @@ private:
                     char buf[256];
                     buf[0] = '\0';
                     int n = std::snprintf(buf, sizeof(buf),
-                                          "[engine] WORKER OOM: %s - recovering", oom.what());
+                                          "[engine] WORKER OOM: %s - recovering | %s", oom.what(),
+                                          instance_.program->debug_host_kv_occupancy().c_str());
                     if (n < 0) { n = 0; buf[0] = '\0'; }
                     if (materializing_ && (size_t)n < sizeof(buf)) {
                         n += std::snprintf(buf + n, sizeof(buf) - n, " mat=%llu",

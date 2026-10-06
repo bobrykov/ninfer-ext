@@ -556,6 +556,30 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    [[nodiscard]] bool has_pending_transaction() const noexcept { return pending_transaction_.has_value(); }
+    // Idle-engine lane debris: a lane whose request lifecycle never returned to Empty or whose
+    // continuation binding was never released (e.g. cancelled request paths) blocks every
+    // future admission to that lane via revalidate_materialization.
+    [[nodiscard]] bool has_idle_lane_debris() const noexcept {
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (requests[lane].lifecycle != Lifecycle::Empty ||
+                active_continuations[lane] < continuation_capacity) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void clear_idle_lanes() noexcept {
+        std::vector<std::uint32_t> lanes;
+        lanes.reserve(max_concurrency);
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) { lanes.push_back(lane); }
+        clear_execution_failure_lanes(lanes);
+    }
+
+    [[nodiscard]] bool has_unsettled_state_fork_public() const noexcept {
+        return has_unsettled_state_fork();
+    }
     [[nodiscard]] bool try_claim_seal_window() noexcept;
     void release_seal_window() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
@@ -689,6 +713,13 @@ public:
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
+    [[nodiscard]] std::string debug_host_kv_occupancy() const {
+        if (!host_kv_extents) { return "host_kv=absent"; }
+        const auto [occupied, capacity] = host_kv_extents->debug_arena_bytes();
+        return "host_kv=" + std::to_string(occupied >> 20) + "/" +
+               std::to_string(capacity >> 20) + "MiB";
+    }
+
     std::unique_ptr<HostKVExtentStore> host_kv_extents;
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;

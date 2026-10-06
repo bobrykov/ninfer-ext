@@ -326,6 +326,10 @@ public:
 
     // Simulates both immediately droppable Host duplicates and Host replicas that become
     // unreferenced when a transaction removes their last address-space membership.
+    [[nodiscard]] std::pair<std::size_t, std::size_t> debug_arena_bytes() const {
+        return {arena_->occupied_bytes(), arena_->capacity_bytes()};
+    }
+
     [[nodiscard]] bool can_allocate_after_page_releases(
         std::span<const HostKVPageReplicaRelease> releases,
         std::span<const HostKVPageReplicaRelease> last_reference_releases,

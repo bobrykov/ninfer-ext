@@ -217,7 +217,7 @@ public:
                 std::optional<ResourcePlan> sealed = program.seal_identity(
                     *selected.candidate, prompt,
                     FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
-                if (!sealed) { return std::nullopt; }
+                if (!sealed) { std::fprintf(stderr, "[mp-decline] seal-failed\n"); return std::nullopt; }
                 MaterializationDiagnostics diagnostics = complete_diagnostics(
                     identity_best->cost, static_cast<std::uint32_t>(candidates.size()),
                     projection_work, planning_started,
@@ -345,7 +345,10 @@ public:
             // admission needs released is the most recent one, it is the only adoptable count, and
             // sparing then keeps every older owner the admission does not need. Only when even it
             // cannot be adopted does the caller fall back to the clear-all backstop.
-            if (lo == ranked && (ranked == 0 || !adoptable_any(ranked))) { return std::nullopt; }
+            if (lo == ranked && !adoptable_any(ranked)) {
+                std::fprintf(stderr, "[mp-decline] no adoptable candidate (ranked=%u lo=%u)\n", ranked, lo);
+                return std::nullopt;
+            }
             LadderRung rung;
             rung.sacrifice   = lo;
             rung.demote_kept = demote_adoptable[lo] >= 0
@@ -403,7 +406,14 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
-            if (!goal) { return std::nullopt; }
+            if (!goal) {
+                std::fprintf(stderr,
+                             "[mp-decline] logical goal unavailable (cand=%u mode=%u outcomes=%zu)\n",
+                             static_cast<unsigned>(assessment.candidate.value),
+                             static_cast<unsigned>(assessment.source_mode),
+                             assessment.owner_outcomes.size());
+                return std::nullopt;
+            }
             const FoldedCost cost =
                 fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);

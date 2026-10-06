@@ -2339,6 +2339,9 @@ ProgramImpl::revalidate_materialization(const AdmissionCandidate& plan,
 
     const AdmissionCandidateImpl& details = *plan.impl_;
     if (details.blocked_host_allocation_bytes != 0) {
+        std::fprintf(stderr,
+                     "[revalidate-decline] blocked host allocation: %llu bytes\n",
+                     static_cast<unsigned long long>(details.blocked_host_allocation_bytes));
         return runtime::PreflightStatus::StalePolicyState;
     }
     const std::optional<MaterializationSourceProtection> protection =

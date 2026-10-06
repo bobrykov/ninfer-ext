@@ -252,6 +252,10 @@ void ProgramImpl::retire_continuation_slot(std::uint32_t index) noexcept {
     sequence.rewrite_checkpoint      = {};
     sequence.rebuild_work            = {};
     sequence.rebuild_tail_begin      = 0;
+    // Defensive: a best-effort release may skip abort_fork when handles are partially
+    // valid (e.g. interrupted by std::bad_alloc mid-fork). A retired slot must never
+    // keep a pending fork flag — planning treats it as unsettled state forever.
+    sequence.state.fork_pending     = false;
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         if (active_continuations[lane] == index) {
             active_continuations[lane] = continuation_capacity;
@@ -513,16 +517,36 @@ bool ProgramImpl::physical_peak_fits(detail::PhysicalResources peak) const noexc
     const auto fits_size = [](std::size_t used, std::size_t added, std::size_t capacity) {
         return added <= capacity && used <= capacity - added;
     };
-    return fits_u32(occupied.device.active_lanes, peak.device.active_lanes,
-                    limits.device.active_lanes) &&
-           fits_u32(occupied.device.state_slots, peak.device.state_slots,
-                    limits.device.state_slots) &&
-           fits_u32(occupied.device.main_kv_pages, peak.device.main_kv_pages,
-                    limits.device.main_kv_pages) &&
-           fits_u32(occupied.device.backend_kv_pages, peak.device.backend_kv_pages,
-                    limits.device.backend_kv_pages) &&
-           fits_u32(occupied.host.state_slots, peak.host.state_slots, limits.host.state_slots) &&
-           fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+    const bool fits =
+        fits_u32(occupied.device.active_lanes, peak.device.active_lanes,
+                 limits.device.active_lanes) &&
+        fits_u32(occupied.device.state_slots, peak.device.state_slots,
+                 limits.device.state_slots) &&
+        fits_u32(occupied.device.main_kv_pages, peak.device.main_kv_pages,
+                 limits.device.main_kv_pages) &&
+        fits_u32(occupied.device.backend_kv_pages, peak.device.backend_kv_pages,
+                 limits.device.backend_kv_pages) &&
+        fits_u32(occupied.host.state_slots, peak.host.state_slots,
+                 limits.host.state_slots) &&
+        fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+    if (!fits) {
+        std::fprintf(stderr,
+                     "[peak-decline] dev_lanes %u+%u/%u dev_state %u+%u/%u "
+                     "dev_main_kv %u+%u/%u dev_backend_kv %u+%u/%u "
+                     "host_state %u+%u/%u host_kv %zu+%zu/%zu\n",
+                     occupied.device.active_lanes, peak.device.active_lanes,
+                     limits.device.active_lanes,
+                     occupied.device.state_slots, peak.device.state_slots,
+                     limits.device.state_slots,
+                     occupied.device.main_kv_pages, peak.device.main_kv_pages,
+                     limits.device.main_kv_pages,
+                     occupied.device.backend_kv_pages, peak.device.backend_kv_pages,
+                     limits.device.backend_kv_pages,
+                     occupied.host.state_slots, peak.host.state_slots,
+                     limits.host.state_slots,
+                     occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+    }
+    return fits;
 }
 
 StateImageHandle

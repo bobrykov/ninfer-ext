@@ -272,7 +272,8 @@ public:
 
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,
                                      const RequestBasePlan& base, std::uint64_t publication_order,
-                                     PlanningAllowance allowance = {}) {
+                                     PlanningAllowance allowance = {},
+                                     bool allow_prefix_reuse = true) {
         if (!std::holds_alternative<std::monostate>(transaction_) ||
             program.has_context_transaction()) {
             return {.readiness = Readiness::TemporarilyBlocked};
@@ -292,6 +293,87 @@ public:
         }
         if (!destination) { return {.readiness = Readiness::TemporarilyBlocked}; }
 
+        // Catalog-wedge root-cause fix (admission entry): candidate assessment runs
+        // peak checks against the full catalog BEFORE any planning fallback could
+        // free space. When no Vacant slot remains (13/13 style wedges, including
+        // the sibling-race case where a concurrent request holds a Claimed slot)
+        // the endpoint candidate is declined on state slots and KV pages alike and
+        // the request degrades to a shared-prefix rebuild. Release every idle
+        // Catalogued entry except the two freshest (live session endpoint + one
+        // spare); Claimed/ReservedForActive/edge-carrying slots are never touched.
+        {
+            bool vacant_exists = false;
+            std::vector<std::pair<std::uint64_t, std::uint32_t>> idle;
+            idle.reserve(catalog_count_);
+            for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+                CatalogEntry& entry = catalog_[slot];
+                if (entry.state == CatalogState::Vacant) {
+                    vacant_exists = true;
+                    continue;
+                }
+                if (entry.state == CatalogState::Catalogued && entry.handle &&
+                    !private_has_active_edge(slot)) {
+                    idle.emplace_back(entry.last_touch_epoch, slot);
+                }
+            }
+            constexpr std::size_t kKeepFreshest = 3;  // endpoint + sibling-duplicate + spare
+            if (!vacant_exists && idle.size() > kKeepFreshest) {
+                // Keep by FRONTIER DEPTH, not recency: aborted sibling requests
+                // publish salvaged shallow continuations stamped with fresh
+                // retention epochs, so a recency-ranked keep-set drops the deep
+                // session endpoint and the next turn rebuilds cold. Depth is the
+                // reuse value; epoch only breaks ties between equal depths.
+                const auto depth = [this](std::uint32_t slot) {
+                    const CatalogEntry& entry = catalog_[slot];
+                    return entry.summary.endpoint ? entry.summary.endpoint->ref.frontier : 0U;
+                };
+                std::sort(idle.begin(), idle.end(),
+                          [&](const auto& lhs, const auto& rhs) {
+                              const std::uint32_t left  = depth(lhs.second);
+                              const std::uint32_t right = depth(rhs.second);
+                              if (left != right) { return left < right; }
+                              return lhs.first < rhs.first;
+                          });
+                for (std::size_t index = 0; index < idle.size() - kKeepFreshest; ++index) {
+                    const std::uint32_t slot = idle[index].second;
+                    CatalogEntry& victim     = catalog_[slot];
+                    std::fprintf(stderr,
+                                 "[slot-prune] catalog wedged: releasing idle continuation "
+                                 "slot=%u id=%llu epoch=%llu\n",
+                                 slot, static_cast<unsigned long long>(victim.id),
+                                 static_cast<unsigned long long>(victim.last_touch_epoch));
+                    erase_session_if_owner(victim.id);
+                    (void)program.release_continuation(std::move(*victim.handle));
+                    clear_catalog_entry(victim);
+                    saturating_increment(context_stats_.pressure_private_owners_evicted);
+                }
+            } else if (!vacant_exists) {
+                // Wedge with no idle surplus: slots are stuck in non-idle states.
+                // Histogram for root-causing the leak (states should return to
+                // Catalogued/Vacant after every finish/abort path).
+                std::uint32_t vacant = 0, claimed = 0, catalogued = 0, reserved = 0, other = 0;
+                std::uint32_t catalogued_with_edge = 0, claimed_with_edge = 0;
+                for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+                    const CatalogEntry& entry = catalog_[slot];
+                    const bool edge           = private_has_active_edge(slot);
+                    switch (entry.state) {
+                        case CatalogState::Vacant:          ++vacant; break;
+                        case CatalogState::Claimed:         ++claimed; claimed_with_edge += edge;
+                            break;
+                        case CatalogState::Catalogued:      ++catalogued; catalogued_with_edge += edge;
+                            break;
+                        case CatalogState::ReservedForActive: ++reserved; break;
+                        default:                            ++other; break;
+                    }
+                }
+                std::fprintf(stderr,
+                             "[slot-wedge] no vacant, idle=%zu: vacant=%u claimed=%u(+%u edge) "
+                             "catalogued=%u(+%u edge) reserved=%u other=%u\n",
+                             idle.size(), vacant, claimed, claimed_with_edge, catalogued,
+                             catalogued_with_edge, reserved, other);
+            }
+        }
+
         const typename Planner::Clock::time_point planning_started = Planner::Clock::now();
         rebuild_prefix_index();
         PrefixDemandRecord provisional_demand;
@@ -299,7 +381,7 @@ public:
             reuse_domain(base.context_cache().session_key, publication_order);
         provisional_demand.candidate_keys.reserve(base.context_cache().opportunities.size());
         provisional_demand.exact_resident_keys.reserve(prefix_index_.size());
-        if (cache_enabled_) {
+        if (cache_enabled_ && allow_prefix_reuse) {
             for (const auto& opportunity : base.context_cache().opportunities) {
                 if (opportunity.kind != PromptCacheMarkerKind::SharedStablePrefix) { continue; }
                 const std::optional<PrefixShortlistKey> key =
@@ -308,7 +390,7 @@ public:
             }
         }
         std::optional<std::size_t> current_session_cell;
-        if (cache_enabled_ && base.context_cache().session_key &&
+        if (cache_enabled_ && allow_prefix_reuse && base.context_cache().session_key &&
             base.context_cache().update_session_index) {
             current_session_cell = find_session_cell(*base.context_cache().session_key);
         }
@@ -319,7 +401,7 @@ public:
         if (!root) { throw std::logic_error("Program rejected isolated root planning"); }
         candidates.push_back(Candidate{.plan = std::move(*root)});
 
-        if (cache_enabled_) {
+        if (cache_enabled_ && allow_prefix_reuse) {
             for (const PrefixIndexEntry& index : prefix_index_) {
                 if (!valid_prefix_index_entry(index)) { continue; }
                 const std::optional<PrefixShortlistKey> incoming =
@@ -1241,6 +1323,28 @@ public:
         return lane.value < lane_count_ ? lanes_[lane.value] : LogicalLaneState::Free;
     }
 
+    [[nodiscard]] std::string admission_debug_snapshot() const {
+        unsigned catalogued = 0;
+        for (const CatalogEntry& entry : catalog_) {
+            catalogued += entry.state == CatalogState::Catalogued ? 1U : 0U;
+        }
+        unsigned shared = 0;
+        for (const SharedCatalogEntry& entry : shared_catalog_) {
+            shared += entry.state == SharedCatalogState::Catalogued ? 1U : 0U;
+        }
+        unsigned free_lanes = 0;
+        bool transaction_open = !std::holds_alternative<std::monostate>(transaction_);
+        for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
+            free_lanes += lanes_[lane] == LogicalLaneState::Free ? 1U : 0U;
+        }
+        return "catalogued=" + std::to_string(catalogued) +
+               " shared=" + std::to_string(shared) +
+               " free_lanes=" + std::to_string(free_lanes) + "/" +
+               std::to_string(lane_count_) +
+               " txn_open=" + std::to_string(transaction_open ? 1 : 0) +
+               " demand_epoch=" + std::to_string(demand_epoch_);
+    }
+
     void clear_after_program_cleanup() noexcept {
         transaction_.template emplace<std::monostate>();
         for (CatalogEntry& entry : catalog_) {
@@ -2101,6 +2205,10 @@ private:
             });
         }
 
+        // (Catalog-wedge pruning moved to the admission entry in inspect(): candidate
+        // assessment performs peak checks before this point, so freeing here was too
+        // late for the endpoint candidate.)
+
         bool pressure_inputs_built       = false;
         const auto build_pressure_inputs = [&]() -> typename Planner::PressureInputs {
             if (pressure_inputs_built) {
@@ -2249,19 +2357,37 @@ private:
                 candidate_inputs, [&](const typename Planner::CandidateInput& input) {
                     return input.id == candidate_id;
                 });
-            if (candidate_record == candidate_inputs.end()) { return std::nullopt; }
+            if (candidate_record == candidate_inputs.end()) {
+                std::fprintf(stderr, "[goal-decline] candidate id %u not in inputs (n=%zu)\n",
+                             static_cast<unsigned>(candidate_id.value), candidate_inputs.size());
+                return std::nullopt;
+            }
             const std::size_t candidate_index =
                 static_cast<std::size_t>(candidate_record - candidate_inputs.begin());
             const Candidate& candidate = candidates[candidate_index];
             if (candidate.shared_source && source_mode != PrivateSourceMode::Retain) {
+                std::fprintf(stderr, "[goal-decline] shared-source mode mismatch (%u)\n",
+                             static_cast<unsigned>(source_mode));
                 return std::nullopt;
             }
+            // A source-less root in Retain mode is legitimate ONLY as a cold start:
+            // when a cached reuse source exists for this request, decline the root so
+            // the planner selects the cached source instead (full re-prefill is far
+            // costlier than anchor transfer). With no sources at all (post-recovery
+            // empty catalogs), fall through to the vacant-slot publication scan.
+            const bool reuse_source_exists = std::any_of(
+                candidates.begin(), candidates.end(), [](const Candidate& c) {
+                    return c.private_source.has_value() || c.shared_source.has_value();
+                });
             if (!candidate.private_source && !candidate.shared_source &&
-                source_mode == PrivateSourceMode::Retain) {
+                source_mode == PrivateSourceMode::Retain && reuse_source_exists) {
+                std::fprintf(stderr, "[goal-decline] root+Retain guard (reuse exists)\n");
                 return std::nullopt;
             }
             if (candidate.private_source && source_mode != PrivateSourceMode::Retain &&
                 source_mode != PrivateSourceMode::ConsumeToActive) {
+                std::fprintf(stderr, "[goal-decline] private-source mode mismatch (%u)\n",
+                             static_cast<unsigned>(source_mode));
                 return std::nullopt;
             }
 
@@ -2270,7 +2396,12 @@ private:
                 publication_slot = candidate.private_source->slot;
             } else {
                 for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
-                    if (catalog_[slot].state == CatalogState::Vacant) {
+                    // Publishable: Vacant, or a stale Claimed/ReservedForActive leftover in an
+                    // idle engine (no catalogued entry, no active edge). Slots leak into these
+                    // intermediate states after request completion; treating only Vacant as
+                    // publishable starves publication once traffic has cycled the catalog.
+                    if (catalog_[slot].state != CatalogState::Catalogued &&
+                        !private_has_active_edge(slot)) {
                         publication_slot = slot;
                         break;
                     }
@@ -2281,31 +2412,39 @@ private:
                 const PressureOwnerOutcome& outcome = outcomes[row];
                 if (outcome.disposition != VictimDisposition::Retained &&
                     outcome.disposition != VictimDisposition::Evicted) {
+                    std::fprintf(stderr, "[goal-decline] outcome disposition invalid\n");
                     return std::nullopt;
                 }
                 if (std::find_if(outcomes.begin(), outcomes.begin() + row,
                                  [&](const PressureOwnerOutcome& prior) {
                                      return prior.owner == outcome.owner;
                                  }) != outcomes.begin() + row) {
-                    return std::nullopt;
+                        return std::nullopt;
                 }
                 const auto record =
                     std::ranges::find_if(owner_records, [&](const PlanningOwnerRecord& item) {
                         return item.id == outcome.owner;
                     });
-                if (record == owner_records.end()) { return std::nullopt; }
+                if (record == owner_records.end()) {
+                        std::fprintf(stderr, "[goal-decline] outcome owner %u has no record (records=%zu outcomes=%zu)\n",
+                                     static_cast<unsigned>(outcome.owner.value), owner_records.size(), outcomes.size());
+                        return std::nullopt; }
                 const bool shared = record->capability.owner.kind == LogicalOwnerKind::SharedPrefix;
                 if (!shared) {
                     const std::uint32_t slot = record->capability.slot;
                     if (slot >= catalog_count_ ||
                         (candidate.private_source && slot == candidate.private_source->slot)) {
-                        return std::nullopt;
+                                return std::nullopt;
                     }
                     const CatalogEntry& entry = catalog_[slot];
                     if (entry.state != CatalogState::Catalogued || !entry.handle ||
                         entry.id != record->capability.owner.id ||
                         entry.revision != record->capability.generation ||
                         private_has_active_edge(slot)) {
+                        std::fprintf(stderr,
+                                     "[goal-decline] private entry unstable slot=%u "
+                                     "edge=%u\n", slot,
+                                     private_has_active_edge(slot) ? 1U : 0U);
                         return std::nullopt;
                     }
                     if (publication_slot == kInvalidCatalogSlot &&
@@ -2327,7 +2466,21 @@ private:
                     }
                 }
             }
-            if (publication_slot == kInvalidCatalogSlot) { return std::nullopt; }
+            if (publication_slot == kInvalidCatalogSlot) {
+                // Root-cause fix: an empty (or non-evictable) catalog must still publish.
+                // The eviction-only slot assignment starved admission on fresh boots and
+                // whenever no owner was evicted — take a vacant private slot instead.
+                for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+                    if (catalog_[slot].state == CatalogState::Vacant) {
+                        publication_slot = slot;
+                        break;
+                    }
+                }
+            }
+            if (publication_slot == kInvalidCatalogSlot) {
+                std::fprintf(stderr, "[goal-decline] no publishable slot (all catalogued/active)\n");
+                return std::nullopt;
+            }
             return typename Planner::LogicalGoal{.publication_slot = publication_slot};
         };
 
@@ -2357,6 +2510,10 @@ private:
                                            })
                     : candidate_inputs.end();
         if (!planned || !planned->plan || selected_candidate == candidate_inputs.end()) {
+            std::fprintf(stderr,
+                         "[planner-decline] planned=%d has_plan=%d candidates=%zu\n",
+                         planned ? 1 : 0, (planned && planned->plan) ? 1 : 0,
+                         candidates.size());
             return std::nullopt;
         }
 

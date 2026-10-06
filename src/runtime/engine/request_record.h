@@ -183,6 +183,9 @@ struct RequestRecord {
     std::optional<FinishReason> terminal_reason;
 
     std::optional<BasePlan> base_plan;
+    // Set when admission policy deferred this request in an idle engine: forces a plain
+    // no-reuse (cold prefill) admission so the request is served instead of starved.
+    bool force_plain_prefill = false;
     std::uint64_t remaining_service_work = 0;
     std::uint64_t backfill_epoch         = 0;
     BackfillClass backfill_class         = BackfillClass::None;

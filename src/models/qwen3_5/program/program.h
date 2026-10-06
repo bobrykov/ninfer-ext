@@ -944,6 +944,12 @@ public:
     [[nodiscard]] ContextTransactionProgress
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
+    [[nodiscard]] std::string debug_host_kv_occupancy() const;
+    [[nodiscard]] bool has_pending_transaction() const;
+    [[nodiscard]] bool has_unsettled_state_fork() const;
+    [[nodiscard]] bool has_idle_lane_debris() const;
+    void clear_idle_lanes() noexcept;
+
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] PrefillProgress
     advance_prefill(SequenceHandle sequence, runtime::PrefillPace pace = runtime::PrefillPace::Idle,
