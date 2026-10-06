@@ -342,8 +342,21 @@ public:
                                  "slot=%u id=%llu epoch=%llu\n",
                                  slot, static_cast<unsigned long long>(victim.id),
                                  static_cast<unsigned long long>(victim.last_touch_epoch));
+                    // release_continuation silently no-ops while the continuation is pinned or
+                    // fails the strict release checks — erasing the catalog entry anyway would
+                    // orphan the program-side slot together with its KV address spaces and
+                    // pages forever (an address-descriptor leak that exhausts create_inactive()).
+                    // Erase bookkeeping only when the release actually consumed the handle.
+                    const auto released =
+                        program.release_continuation(std::move(*victim.handle));
+                    if (released.status != runtime::ConsumeStatus::Consumed) {
+                        std::fprintf(stderr,
+                                     "[slot-prune] continuation slot=%u id=%llu still pinned; "
+                                     "entry kept for a later retry\n",
+                                     slot, static_cast<unsigned long long>(victim.id));
+                        continue;
+                    }
                     erase_session_if_owner(victim.id);
-                    (void)program.release_continuation(std::move(*victim.handle));
                     clear_catalog_entry(victim);
                     saturating_increment(context_stats_.pressure_private_owners_evicted);
                 }

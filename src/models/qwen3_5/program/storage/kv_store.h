@@ -947,10 +947,18 @@ public:
     }
 
     [[nodiscard]] std::optional<KVAddressSpaceHandle> create_inactive() noexcept {
-        if (free_count_ == 0) { return std::nullopt; }
+        if (free_count_ == 0) {
+            std::fprintf(stderr,
+                         "[kv-addresses] descriptor pool exhausted: capacity=%u occupied=%u "
+                         "(leaked address spaces hold their Device KV pages)\n",
+                         capacity(), occupied());
+            return std::nullopt;
+        }
         const std::uint32_t index = free_[--free_count_];
         Address& address          = addresses_[index];
         if (address.occupied) {
+            std::fprintf(stderr,
+                         "[kv-addresses] free-list corruption at index=%u (occupied)\n", index);
             free_[free_count_++] = index;
             return std::nullopt;
         }

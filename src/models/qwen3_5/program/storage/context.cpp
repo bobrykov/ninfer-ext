@@ -1937,8 +1937,29 @@ void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main
         (backend_tokens != 0 && !sequence.kv->backend)) {
         throw std::logic_error("KV commit request is outside the sequence bundle");
     }
+    // Regression diagnostic: commit_frontier throws when the sequence asks to commit below the
+    // address's committed frontier — a fork/restore path left the address deeper than the
+    // sequence's view. Log the discriminating values before the throw.
+    if (main_tokens < text_kv_addresses->committed_frontier(sequence.kv->text) ||
+        kv_pages_for_tokens(main_tokens) > text_kv_addresses->mapped_pages(sequence.kv->text)) {
+        std::fprintf(stderr,
+                     "[frontier-regress] lane=%u text_kv_valid=%u text_committed=%u "
+                     "text_pages=%u backend_valid=%u rewrite=%d anchors=%zu\n",
+                     sequence.lane, main_tokens,
+                     text_kv_addresses->committed_frontier(sequence.kv->text),
+                     text_kv_addresses->mapped_pages(sequence.kv->text), backend_tokens,
+                     sequence.rewrite_state ? 1 : 0, sequence.long_anchors.size());
+    }
     text_kv_addresses->commit_frontier(sequence.kv->text, main_tokens);
     if (sequence.kv->backend) {
+        if (backend_tokens <
+            backend_kv_addresses->committed_frontier(*sequence.kv->backend)) {
+            std::fprintf(stderr,
+                         "[frontier-regress] lane=%u backend_valid=%u backend_committed=%u "
+                         "(mtp/spec mapping mismatch)\n",
+                         sequence.lane, backend_tokens,
+                         backend_kv_addresses->committed_frontier(*sequence.kv->backend));
+        }
         backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_tokens);
     }
 }
