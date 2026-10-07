@@ -511,6 +511,10 @@ ReleaseResult Program::release_continuation(ContinuationHandle&& continuation) n
     return impl_->release_continuation(std::move(continuation));
 }
 
+std::uint32_t Program::kv_address_descriptors_free() const noexcept {
+    return impl_->kv_address_descriptors_free();
+}
+
 ReleaseResult Program::release_shared_prefix(SharedPrefixHandle&& shared) noexcept {
     return impl_->release_shared_prefix(std::move(shared));
 }

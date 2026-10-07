@@ -1014,6 +1014,9 @@ public:
     device_kv_lease_settlement_tokens(SequenceHandle sequence,
                                       std::uint32_t forced_span_tokens) const noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
+    // Minimum free KV address-space descriptors across the text/backend stores; the
+    // engine's admission prune treats a low value as address-pool pressure.
+    [[nodiscard]] std::uint32_t kv_address_descriptors_free() const noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
 

@@ -1384,6 +1384,12 @@ private:
     // Periodic device-KV page leak audit (see KVAddressSpaceStore::page_audit).
     void maybe_audit_page_pools() const;
     mutable std::chrono::steady_clock::time_point next_page_audit_{};
+    // Free KV address-space descriptors across the text/backend stores (minimum).
+    // The engine's admission prune uses this to detect address-pool pressure before
+    // create_inactive() starts failing ("descriptor pool exhausted" wedges).
+public:
+    [[nodiscard]] std::uint32_t kv_address_descriptors_free() const noexcept;
+private:
     // KV streaming: a request's Device window in one pool, an equal share of that pool.
     [[nodiscard]] std::uint32_t kv_stream_window(const LogicalKVPageStore& pages) const noexcept {
         return pages.physical_pool().capacity_pages() / max_concurrency;

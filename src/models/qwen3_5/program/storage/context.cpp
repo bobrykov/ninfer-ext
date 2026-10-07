@@ -1932,6 +1932,15 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
     }
 }
 
+std::uint32_t ProgramImpl::kv_address_descriptors_free() const noexcept {
+    if (!text_kv_addresses) { return 0; }
+    const std::uint32_t text_free = text_kv_addresses->capacity() - text_kv_addresses->occupied();
+    if (!backend_kv_addresses) { return text_free; }
+    const std::uint32_t backend_free =
+        backend_kv_addresses->capacity() - backend_kv_addresses->occupied();
+    return text_free < backend_free ? text_free : backend_free;
+}
+
 void ProgramImpl::maybe_audit_page_pools() const {
     const auto now = std::chrono::steady_clock::now();
     if (next_page_audit_.time_since_epoch().count() != 0 && now < next_page_audit_) { return; }

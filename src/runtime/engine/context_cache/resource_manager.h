@@ -317,7 +317,15 @@ public:
                 }
             }
             constexpr std::size_t kKeepFreshest = 3;  // endpoint + sibling-duplicate + spare
-            if (!vacant_exists && idle.size() > kKeepFreshest) {
+            // Address-pool pressure: the publication catalog (above) and the program's KV
+            // address-space descriptor pool (14) are separate resources. Retained
+            // continuations accumulate address spaces until create_inactive() fails and
+            // every materialization dies with "descriptor pool exhausted". Prune on
+            // address pressure too — keep only the endpoint + one spare then.
+            const bool address_pressure = program.kv_address_descriptors_free() < 3;
+            const std::size_t keep_under_pressure = 2;
+            const std::size_t keep = address_pressure ? keep_under_pressure : kKeepFreshest;
+            if ((!vacant_exists || address_pressure) && idle.size() > keep) {
                 // Keep by FRONTIER DEPTH, not recency: aborted sibling requests
                 // publish salvaged shallow continuations stamped with fresh
                 // retention epochs, so a recency-ranked keep-set drops the deep
@@ -334,7 +342,7 @@ public:
                               if (left != right) { return left < right; }
                               return lhs.first < rhs.first;
                           });
-                for (std::size_t index = 0; index < idle.size() - kKeepFreshest; ++index) {
+                for (std::size_t index = 0; index < idle.size() - keep; ++index) {
                     const std::uint32_t slot = idle[index].second;
                     CatalogEntry& victim     = catalog_[slot];
                     std::fprintf(stderr,
