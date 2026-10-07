@@ -58,6 +58,10 @@ public:
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
 
+    // Leak-audit helper: stable identity within one LogicalKVPageStore (index only;
+    // generation is irrelevant for set membership).
+    [[nodiscard]] std::uint32_t audit_index() const noexcept { return index_; }
+
     [[nodiscard]] friend bool operator==(LogicalKVPageHandle,
                                          LogicalKVPageHandle) noexcept = default;
 
@@ -1933,6 +1937,36 @@ public:
         free_[free_count_++]           = index;
         rebuild_checkpoint_protection();
         return true;
+    }
+
+    // Leak audit: live logical pages versus the set of pages still referenced by some
+    // address-space membership. The delta is pages whose references outlived every
+    // membership — the device-KV page leak, quantified per tier.
+    [[nodiscard]] std::string page_audit() const {
+        std::vector<std::uint32_t> members;
+        std::uint32_t addresses_occupied = 0;
+        std::uint64_t membership_cells   = 0;
+        for (const Address& address : addresses_) {
+            if (!address.occupied) { continue; }
+            ++addresses_occupied;
+            for (std::uint32_t page = 0; page < address.page_count; ++page) {
+                const LogicalKVPageHandle logical = membership(address, page);
+                if (pages_->valid(logical)) {
+                    members.push_back(logical.audit_index());
+                    ++membership_cells;
+                }
+            }
+        }
+        std::sort(members.begin(), members.end());
+        const std::size_t unique = std::unique(members.begin(), members.end()) - members.begin();
+        const std::uint32_t live = pages_->occupied();
+        char buffer[192];
+        std::snprintf(buffer, sizeof(buffer),
+                      "live=%u unique_members=%zu cells=%llu addrs=%u/%u leaked=%lld",
+                      live, unique, static_cast<unsigned long long>(membership_cells),
+                      addresses_occupied, capacity(),
+                      static_cast<long long>(live) - static_cast<long long>(unique));
+        return std::string(buffer);
     }
 
 private:

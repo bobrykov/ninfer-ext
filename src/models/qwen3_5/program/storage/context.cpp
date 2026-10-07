@@ -1910,6 +1910,7 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
     ensure_sequence_kv_lease(sequence, main_tokens, backend_tokens);
+    maybe_audit_page_pools();
     // Prefill maps each chunk against the admission window; streaming makes room for it. Host KV
     // is not reserved at admission, so a full arena fails the step as a capacity shortfall.
     if (kv_stream &&
@@ -1929,6 +1930,18 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
         backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,
                                                       device.stream);
     }
+}
+
+void ProgramImpl::maybe_audit_page_pools() const {
+    const auto now = std::chrono::steady_clock::now();
+    if (next_page_audit_.time_since_epoch().count() != 0 && now < next_page_audit_) { return; }
+    next_page_audit_ = now + std::chrono::seconds(300);
+    if (!text_kv_addresses) { return; }
+    std::fprintf(stderr, "[page-audit] text %s", text_kv_addresses->page_audit().c_str());
+    if (backend_kv_addresses) {
+        std::fprintf(stderr, " | backend %s", backend_kv_addresses->page_audit().c_str());
+    }
+    std::fprintf(stderr, "\n");
 }
 
 void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

@@ -1381,6 +1381,9 @@ private:
     }
     void ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_t main_tokens,
                                   std::uint32_t backend_tokens);
+    // Periodic device-KV page leak audit (see KVAddressSpaceStore::page_audit).
+    void maybe_audit_page_pools() const;
+    mutable std::chrono::steady_clock::time_point next_page_audit_{};
     // KV streaming: a request's Device window in one pool, an equal share of that pool.
     [[nodiscard]] std::uint32_t kv_stream_window(const LogicalKVPageStore& pages) const noexcept {
         return pages.physical_pool().capacity_pages() / max_concurrency;
