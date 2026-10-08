@@ -1843,6 +1843,12 @@ public:
         return require(handle).committed_frontier;
     }
 
+    // Audit helper: mapped page count — mirrors the second arm of commit_frontier's
+    // invariant (pages_for_tokens(frontier) must not exceed page_count).
+    [[nodiscard]] std::uint32_t page_count(KVAddressSpaceHandle handle) const {
+        return require(handle).page_count;
+    }
+
     [[nodiscard]] std::int32_t bound_row(KVAddressSpaceHandle handle) const noexcept {
         if (!valid(handle) || !addresses_[handle.index_].row) { return -1; }
         return addresses_[handle.index_].row->row_index();

@@ -1959,17 +1959,23 @@ void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main
         (backend_tokens != 0 && !sequence.kv->backend)) {
         throw std::logic_error("KV commit request is outside the sequence bundle");
     }
-    // Regression diagnostic: commit_frontier throws when the sequence asks to commit below the
-    // address's committed frontier — a fork/restore path left the address deeper than the
-    // sequence's view. Log the discriminating values before the throw.
+    // Regression diagnostic: commit_frontier throws on EITHER arm of its invariant —
+    // (a) frontier below the committed frontier (unrewound reuse), or
+    // (b) pages_for_tokens(frontier) above the address's page count (undersized
+    //     fork/resize destination). Log the discriminating values for both arms.
     if (main_tokens < text_kv_addresses->committed_frontier(sequence.kv->text) ||
-        kv_pages_for_tokens(main_tokens) > text_kv_addresses->mapped_pages(sequence.kv->text)) {
+        kv_pages_for_tokens(main_tokens) > text_kv_addresses->page_count(sequence.kv->text)) {
         std::fprintf(stderr,
-                     "[frontier-regress] lane=%u text_kv_valid=%u text_committed=%u "
-                     "text_pages=%u backend_valid=%u rewrite=%d anchors=%zu\n",
-                     sequence.lane, main_tokens,
+                     "[frontier-regress] lane=%u arm=%s text_kv_valid=%u text_committed=%u "
+                     "text_pages=%u need_pages=%u backend_valid=%u rewrite=%d anchors=%zu\n",
+                     sequence.lane,
+                     (main_tokens < text_kv_addresses->committed_frontier(sequence.kv->text)
+                          ? "rewind"
+                          : "undersized"),
+                     main_tokens,
                      text_kv_addresses->committed_frontier(sequence.kv->text),
-                     text_kv_addresses->mapped_pages(sequence.kv->text), backend_tokens,
+                     text_kv_addresses->page_count(sequence.kv->text),
+                     kv_pages_for_tokens(main_tokens), backend_tokens,
                      sequence.rewrite_state ? 1 : 0, sequence.long_anchors.size());
     }
     text_kv_addresses->commit_frontier(sequence.kv->text, main_tokens);

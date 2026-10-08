@@ -323,7 +323,11 @@ public:
             // every materialization dies with "descriptor pool exhausted". Prune on
             // address pressure too — keep only the endpoint + one spare then.
             const bool address_pressure = program.kv_address_descriptors_free() < 3;
-            const std::size_t keep_under_pressure = 2;
+            // Keep three under pressure as well: endpoint + sibling-duplicate + spare.
+            // Keeping two starved the second request of every dch sibling pair at depth
+            // (shared-prefix fallbacks alternating with 95%+ turns) while the wedge is
+            // already prevented by firing the prune at <3 free descriptors.
+            const std::size_t keep_under_pressure = 3;
             const std::size_t keep = address_pressure ? keep_under_pressure : kKeepFreshest;
             if ((!vacant_exists || address_pressure) && idle.size() > keep) {
                 // Keep by FRONTIER DEPTH, not recency: aborted sibling requests

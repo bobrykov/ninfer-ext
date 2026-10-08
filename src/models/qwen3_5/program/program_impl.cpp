@@ -538,6 +538,22 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             }
             const std::uint32_t chunk_begin = cursor;
             cursor += result.processed_tokens;
+            // Frontier-regression diagnostic (the other commit_frontier call site): mirror
+            // BOTH invariant arms — a reused address either not rewound (committed ahead
+            // of this fresh scoring cursor) or undersized (page count below the cursor's
+            // page needs) is the suspected source of "KV committed frontier is invalid".
+            const std::uint32_t score_committed =
+                text_kv_addresses->committed_frontier(*address);
+            if (score_committed > cursor ||
+                kv_pages_for_tokens(cursor) > text_kv_addresses->page_count(*address)) {
+                std::fprintf(stderr,
+                             "[frontier-regress] causal-score arm=%s committed=%u cursor=%u "
+                             "pages=%u need_pages=%u\n",
+                             score_committed > cursor ? "rewind" : "undersized",
+                             score_committed, cursor,
+                             text_kv_addresses->page_count(*address),
+                             kv_pages_for_tokens(cursor));
+            }
             text_kv_addresses->commit_frontier(*address, cursor);
 
             std::uint32_t selected = std::max(chunk_begin, scored_predictor_begin);
