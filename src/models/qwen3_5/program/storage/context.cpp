@@ -1980,13 +1980,22 @@ void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main
     }
     text_kv_addresses->commit_frontier(sequence.kv->text, main_tokens);
     if (sequence.kv->backend) {
-        if (backend_tokens <
-            backend_kv_addresses->committed_frontier(*sequence.kv->backend)) {
+        // One-token mapping-skew self-healing: the fork sizes the backend with
+        // backend_frontier_at (main - 1) while spec bookkeeping can hold
+        // mtp_kv_valid == main exactly at a page boundary — leaving the address one
+        // page short of the commit. Extend the mapping within the entitlement
+        // instead of failing the whole request; a genuine over-run (beyond one
+        // page of skew or entitlement) still throws through ensure_mapped.
+        if (kv_pages_for_tokens(backend_tokens) >
+            backend_kv_addresses->page_count(*sequence.kv->backend)) {
             std::fprintf(stderr,
-                         "[frontier-regress] lane=%u backend_valid=%u backend_committed=%u "
-                         "(mtp/spec mapping mismatch)\n",
+                         "[frontier-fixup] lane=%u backend_valid=%u backend_pages=%u "
+                         "need_pages=%u: extending mapping (mtp/spec one-page skew)\n",
                          sequence.lane, backend_tokens,
-                         backend_kv_addresses->committed_frontier(*sequence.kv->backend));
+                         backend_kv_addresses->page_count(*sequence.kv->backend),
+                         kv_pages_for_tokens(backend_tokens));
+            backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend,
+                                                          backend_tokens, device.stream);
         }
         backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_tokens);
     }

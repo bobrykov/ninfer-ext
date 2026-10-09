@@ -316,7 +316,7 @@ public:
                     idle.emplace_back(entry.last_touch_epoch, slot);
                 }
             }
-            constexpr std::size_t kKeepFreshest = 3;  // endpoint + sibling-duplicate + spare
+            constexpr std::size_t kKeepFreshest = 4;  // endpoint + sibling-duplicate + spare + one anchor-bearing elder
             // Address-pool pressure: the publication catalog (above) and the program's KV
             // address-space descriptor pool (14) are separate resources. Retained
             // continuations accumulate address spaces until create_inactive() fails and
@@ -327,7 +327,7 @@ public:
             // Keeping two starved the second request of every dch sibling pair at depth
             // (shared-prefix fallbacks alternating with 95%+ turns) while the wedge is
             // already prevented by firing the prune at <3 free descriptors.
-            const std::size_t keep_under_pressure = 3;
+            const std::size_t keep_under_pressure = 4;  // endpoint + sibling-duplicate + spare + one anchor-bearing elder
             const std::size_t keep = address_pressure ? keep_under_pressure : kKeepFreshest;
             if ((!vacant_exists || address_pressure) && idle.size() > keep) {
                 // Keep by FRONTIER DEPTH, not recency: aborted sibling requests
