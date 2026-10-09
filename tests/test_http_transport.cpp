@@ -1,4 +1,5 @@
 #include "serve/http_transport.h"
+#include "serve/request.h"
 
 #include <atomic>
 #include <chrono>
@@ -109,6 +110,44 @@ int test_sse_response_headers() {
                  "SSE response lost its no-cache or anti-buffering header");
 }
 
+int test_schema_number_precision() {
+    int failures = 0;
+    // A schema number that the JSON number representation cannot preserve must be refused where it
+    // was written; a number outside a schema, or an annotation inside one, must not be.
+    const std::vector<std::pair<std::string, std::string>> cases{
+        {R"({"response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"number","minimum":0.10000000000000001}}}})",
+         "response_format.json_schema.schema/minimum"},
+        {R"({"text":{"format":{"type":"json_schema","name":"x","schema":{"type":"number","minimum":1e-400}}}})",
+         "text.format.schema/minimum"},
+        {R"({"output_config":{"format":{"type":"json_schema","schema":{"type":"number","maximum":0.10000000000000001}}}})",
+         "output_config.format.schema/maximum"},
+        {R"({"tools":[{"type":"function","function":{"name":"x","strict":true,"parameters":{"type":"object","properties":{"x":{"minimum":0.10000000000000001}}}}}]})",
+         "tools/0/function/parameters/properties/x/minimum"},
+        {R"({"tools":[{"type":"namespace","name":"n","tools":[{"type":"function","name":"x","strict":true,"parameters":{"type":"object","properties":{"x":{"minimum":0.10000000000000001}}}}]}]})",
+         "tools/0/tools/0/parameters/properties/x/minimum"},
+        {R"({"tools":[{"name":"x","strict":true,"input_schema":{"type":"object","properties":{"x":{"minimum":0.10000000000000001}}}}]})",
+         "tools/0/input_schema/properties/x/minimum"},
+        {R"({"temperature":0.10000000000000001,"tools":[{"name":"x","strict":false,"input_schema":{"minimum":0.10000000000000001}}]})",
+         ""},
+        {R"({"response_format":{"json_schema":{"schema":{"type":"number","default":0.10000000000000001,"minimum":0.1}}}})",
+         ""},
+    };
+    for (const auto& [body, expected] : cases) {
+        httplib::Request request;
+        request.body = body;
+        try {
+            (void)ninfer::serve::parse_json_body(request);
+            failures += check(expected.empty(), "HTTP rounded a schema number before validation");
+        } catch (const ninfer::serve::ApiException& error) {
+            failures +=
+                check(!expected.empty() && error.error().code == "unsupported_json_schema" &&
+                          error.error().param == expected,
+                      "schema precision error lost its protocol location");
+        }
+    }
+    return failures;
+}
+
 int test_prompt_json_member_order() {
     httplib::Request request;
     request.body =
@@ -189,15 +228,92 @@ int test_inherited_socket_liveness() {
         "accepted HTTP socket did not inherit TCP_USER_TIMEOUT");
     return failures;
 }
+
+using SocketSetup = void (*)(int);
+
+void configure_http_listener(int socket) { ninfer::serve::configure_http_server_socket(socket); }
+
+// The listener setup of servers such as llama.cpp and uvicorn.
+void reuse_address_only(int socket) {
+    const int enabled = 1;
+    (void)::setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+}
+
+// Leaves a server-closed connection in TIME_WAIT on a loopback port whose
+// listener was prepared by `setup`, and closes that listener. Returns the
+// port's address, or a zero port on failure.
+sockaddr_in leave_server_time_wait(SocketSetup setup) {
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
+    if (listener.get() < 0) { return {}; }
+    setup(listener.get());
+    socklen_t address_size = sizeof(address);
+    if (::bind(listener.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
+        ::listen(listener.get(), 1) != 0 ||
+        ::getsockname(listener.get(), reinterpret_cast<sockaddr*>(&address), &address_size) != 0) {
+        return {};
+    }
+    Socket client(::socket(AF_INET, SOCK_STREAM, 0));
+    if (client.get() < 0 || ::connect(client.get(), reinterpret_cast<const sockaddr*>(&address),
+                                      sizeof(address)) != 0) {
+        return {};
+    }
+    {
+        // The server closes first, so its side of the connection enters TIME_WAIT.
+        Socket accepted(::accept(listener.get(), nullptr, nullptr));
+        if (accepted.get() < 0) { return {}; }
+    }
+    char byte = 0;
+    if (::recv(client.get(), &byte, 1, 0) != 0) { return {}; }
+    return address;
+}
+
+bool successor_binds(const sockaddr_in& address, SocketSetup setup) {
+    Socket successor(::socket(AF_INET, SOCK_STREAM, 0));
+    if (successor.get() < 0) { return false; }
+    setup(successor.get());
+    return ::bind(successor.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) ==
+           0;
+}
+
+int test_successor_binds_over_time_wait() {
+    struct Case {
+        SocketSetup previous;
+        SocketSetup next;
+        const char* message;
+    };
+
+    const Case cases[] = {
+        {configure_http_listener, reuse_address_only,
+         "a SO_REUSEADDR server could not bind over the HTTP listener's TIME_WAIT connection"},
+        {reuse_address_only, configure_http_listener,
+         "the HTTP listener could not bind over a SO_REUSEADDR server's TIME_WAIT connection"},
+        {configure_http_listener, configure_http_listener,
+         "the HTTP listener could not bind over its own TIME_WAIT connection"},
+    };
+    int failures = 0;
+    for (const Case& test_case : cases) {
+        const sockaddr_in address = leave_server_time_wait(test_case.previous);
+        if (address.sin_port == 0) {
+            failures += check(false, "failed to leave a TIME_WAIT test connection");
+            continue;
+        }
+        failures += check(successor_binds(address, test_case.next), test_case.message);
+    }
+    return failures;
+}
 #endif
 
 } // namespace
 
 int main() {
-    int failures =
-        test_sse_transport() + test_sse_response_headers() + test_prompt_json_member_order();
+    int failures = test_sse_transport() + test_sse_response_headers() +
+                   test_prompt_json_member_order() + test_schema_number_precision();
 #if defined(__linux__)
     failures += test_inherited_socket_liveness();
+    failures += test_successor_binds_over_time_wait();
 #endif
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

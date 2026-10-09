@@ -12,6 +12,7 @@ run the CLI or HTTP server.
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
+| [Optimizer](optimizer.md) | use-case runbooks and a designed-experiment sweep that picks the fastest/balanced/max-context configuration for a machine |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.
@@ -54,11 +55,14 @@ other references own narrower contracts:
 | [Qwen3.5 model](maintainer/qwen3_5-model.md) | Dense/MoE mathematics, instance config, logical parameters, MTP, Vision and state semantics |
 | [Qwen4Exp model](maintainer/qwen4-exp-model.md) | Qwen3.8-Flash-Next hyper-connection, QSA, n-gram PLE, MoE and MTP mathematics and its FP64 oracle |
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
+| [Constrained decoding](maintainer/constrained-decoding.md) | request constraints, grammar compilation and caching, per-position masks, the sampling and acceptance contract, and current coverage |
+| [EAGLE3](maintainer/eagle3.md) | autoregressive draft graph, three-layer target feature fusion and draft-vocabulary mapping (chain landed and measured; static draft tree pending) |
 | [Prompt-lookup suffix drafter](maintainer/lookup-drafter.md) | Host suffix index, acceptance model, per-lane choice and its phase plan (active work) |
 | [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | candidate selection, retention, materialization and Device/Host checkpoint policy |
 | [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |
 | [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
 | [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |
+| [W4A8 prefill](maintainer/w4a8-prefill.md) | active work: the landed int8 Q4 prefill route, its enablement and measured evidence |
 | [Operational logging](maintainer/logging.md) | log ownership, presentation, severity and data policy |
 | [Linear benchmark](maintainer/linear-benchmark.md) | pure Linear measurement, metrics and suites |
 | [Linear tuning and reports](maintainer/linear-tuning.md) | tuning ranges, priority points, dispatch tradeoffs and final performance report format |

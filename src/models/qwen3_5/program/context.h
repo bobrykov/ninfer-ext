@@ -26,6 +26,7 @@ namespace ninfer::models::qwen3_5::execution {
 
 using qwen3_5::PreparedPromptData;
 using detail::DFlashPersistentState;
+using detail::Eagle3PrefillState;
 using qwen3_5::PromptModality;
 
 struct ExecutionCore {
@@ -48,6 +49,9 @@ struct PrefillContext {
     const qwen3_5::PagedKVCache& text_cache;
     const qwen3_5::PagedKVCache* mtp_cache;
     DFlashPersistentState* dflash;
+    Eagle3PrefillState* eagle3;
+    qwen3_5::PagedKVCacheView eagle3_kv;
+    const qwen3_5::PagedKVCache* eagle3_cache;
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
     Tensor* rewrite_checkpoint_hidden;
@@ -91,6 +95,27 @@ struct MtpBatchContext {
     qwen3_5::QsaIndexMirrors qsa_index_mirrors;
 };
 
+// EAGLE3 reuses the MTP round's host bridge, frame and envelopes; only the draft KV cache and the
+// draft forward differ.
+struct Eagle3BatchContext {
+    ExecutionCore execution;
+    const qwen3_5::PagedKVCache& text_cache;
+    const qwen3_5::PagedKVCache& eagle3_cache;
+    qwen3_5::MtpDecodeState& frame;
+    const qwen3_5::MtpDecodeIngress& host_ingress;
+    qwen3_5::MtpDecodeEgress& host_egress;
+    Tensor& continuation_hidden_store;
+    // Streamed round: the prepared staging of its Host text KV (eager only), or null.
+    qwen3_5::KVHostStaging* text_kv_staging = nullptr;
+    // Streamed QSA round: the prepared index mirrors (eager only).
+    qwen3_5::QsaIndexMirrors qsa_index_mirrors;
+};
+
+// The DFlash round drafts and verifies in one span of work, but a constrained round has to see the
+// drafted ids on the host before it verifies them. These name the two halves separately; a round
+// with no phase runs the whole span, which is what the captured graph holds.
+enum class SpeculativePhase { Forward, Finish };
+
 struct DFlashBatchContext {
     ExecutionCore execution;
     const qwen3_5::PagedKVCache& text_cache;
@@ -99,6 +124,10 @@ struct DFlashBatchContext {
     const qwen3_5::DFlashDecodeIngress& host_ingress;
     qwen3_5::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // The chain the forward phase drafted, on the host, and the event that publishes it. Both are
+    // owned by the Program and outlive the round.
+    std::span<TokenId> host_drafts;
+    CudaCompletionEvent& drafts_ready;
 };
 
 struct DFlashAppendContext {
@@ -155,7 +184,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                                     std::span<const TokenId> ids,
                                                     std::uint32_t nominal_length,
                                                     std::optional<std::uint32_t> split_frontier,
-                                                    bool finalize_at_end);
+                                                    bool finalize_at_end,
+                                                    std::int32_t rope_delta);
 
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
@@ -198,6 +228,15 @@ void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint
                       MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable,
                       bool lookup_only);
 
+// Executes one exact-B EAGLE3 verification/alignment/draft transaction. It reuses the MTP round's
+// host bridge and frame, but verifies with a feature sink that captures the three target layers,
+// then drafts with the EAGLE3 encoder and its one autoregressive decoder layer.
+void eagle3_decode_batch(Eagle3BatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                         MtpCausalAttentionEnvelopes envelopes, DecodeGraphExecutable* executable);
+void capture_eagle3_decode_batch(Eagle3BatchContext& state, std::int32_t batch_size,
+                                 std::uint32_t k, MtpCausalAttentionEnvelopes envelopes,
+                                 DecodeGraphDefinition& definition);
+
 [[nodiscard]] DFlashFeatureSink
 dflash_feature_sink(PrefillContext& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});
 void dflash_append_context(DFlashAppendContext& state, const Tensor& features,
@@ -216,5 +255,10 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
                          DFlashEnvelopes envelopes,
                          ops::CausalAttentionExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
+// One half of the round, run eagerly so the host can fill masks between the phases.
+void dflash_decode_batch_phase(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
+                               DFlashEnvelopes envelopes,
+                               ops::CausalAttentionExecutionEnvelope target_envelope,
+                               SpeculativePhase phase);
 
 } // namespace ninfer::models::qwen3_5::execution

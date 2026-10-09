@@ -49,9 +49,10 @@ ctest --test-dir build --output-on-failure
 
 The suite is largely CPU-bound and single-threaded per test, while each test still
 allocates device fixtures, so a small bounded job count is much faster than a serial run
-and still fits the GPU. `ctest --preset fast` runs the non-model tests six ways
-(142 tests in about 2.3 min against about 16 min serially); `ctest --preset real` runs the
-artifact-dependent model tests one at a time.
+and still fits the GPU. `ctest --preset fast` runs the non-model tests six ways (150 tests, about
+5.5 min, of which `ninfer_offload_moe_exl3_test` alone is 330 s); `ctest --preset fast -E
+offload_moe_exl3` runs the other 149 in about 2.2 min and is the practical inner loop; `ctest
+--preset real` runs the artifact-dependent model tests one at a time.
 
 ```bash
 ctest --preset fast    # six-way parallel, excludes real
@@ -125,7 +126,7 @@ Run the native Python suites with the project Python environment:
 ```bash
 python3 -m pytest \
   tests/artifact tests/convert \
-  tests/test_serve_corpus.py
+  tests/test_serve_corpus.py tests/test_speed_of_light.py
 ```
 
 The Python suites exercise conversion and encoded output, without running model inference.
@@ -195,6 +196,19 @@ NINFER_ARTIFACT_RESIDUE=$PWD/models/qwen3_8_27b_dflash2.ninfer \
   --artifact models/qwen3_8_27b.ninfer --backend mtp --draft-k 5
 ./build/tests/ninfer_qwen3_5_spec_residue_real_test \
   --artifact models/qwen3_8_27b.ninfer --backend dflash2 --draft-k 15
+./build/tests/ninfer_qwen3_5_spec_residue_real_test \
+  --artifact models/qwen3_6_35b_a3b_nvfp4_eagle3.ninfer --backend eagle3 --draft-k 3
+```
+
+A speculative backend must also complete rounds that carry more than one request: the draft
+proposal reads its logits out of the round frame, whose width is fixed by the backend's own head.
+Two lanes is enough to expose a frame that is wider than that head, with capture (the default)
+failing during engine construction rather than at the first batched round:
+
+```bash
+./build/tests/ninfer_qwen3_5_spec_concurrency_eagle3_real_test \
+  --artifact models/qwen3_6_35b_a3b_nvfp4_eagle3.ninfer --backend eagle3 --draft-k 3 \
+  --concurrency 2
 ```
 
 Without an artifact, CTest marks these real Engine tests as skipped. Run GPU integration

@@ -8,13 +8,28 @@
 #include <string>
 #include <string_view>
 
+namespace ninfer::text {
+struct ParsedJsonNumbers;
+}
+
 namespace ninfer::serve {
+// Rejects a request whose schema declares a number the JSON number representation cannot preserve.
+void validate_schema_number_input(const text::ParsedJsonNumbers& parsed);
 
 [[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {});
 
 std::optional<int> optional_int(const RequestJson& object, const char* key);
 std::optional<double> optional_number(const RequestJson& object, const char* key);
 bool optional_bool(const RequestJson& object, const char* key, bool fallback);
+// Shared by all three protocols: one GBNF source under structured_outputs.grammar. The aliases
+// llama.cpp and vLLM used are refused with a pointer instead of being ignored.
+// Standard JSON output formats differ per protocol: Chat nests a json_schema object, Responses and
+// Anthropic declare the schema at the format's own level, and Anthropic has no json_object mode.
+enum class JsonFormatProtocol { Chat, Responses, Anthropic };
+void parse_json_output_format(const RequestJson& format, GenerationRequest& request,
+                              const std::string& param, JsonFormatProtocol protocol);
+
+void parse_structured_outputs(const RequestJson& body, GenerationRequest& request);
 
 [[nodiscard]] bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept;
 

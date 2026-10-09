@@ -51,6 +51,12 @@ artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-to
 concurrency, prefix reuse, and image/video request surfaces. It may remain combined with
 `--vision`.
 
+Artifacts carrying EAGLE3 draft weights serve `--spec eagle3 --draft-tokens N` (1..15). The draft
+keeps its own draft head, so `--lm-head-draft` is rejected, and it adapts its draft length like MTP
+unless `--fixed-draft` pins it. `--draft-tree N` selects the static draft-tree root width, whose
+only implemented value is `1`; a wider tree is rejected when the server starts. See
+[EAGLE3](maintainer/eagle3.md).
+
 When `--model-id` is omitted, the server advertises and accepts the artifact's `metadata.name`,
 falling back to its architecture name when no name is stored. An explicit `--model-id` is a public
 HTTP alias override and does not select or alter model execution.
@@ -58,7 +64,7 @@ HTTP alias override and does not select or alter model execution.
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
 allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
 `--vision` when the server must accept image or video input. Speculative residency is likewise
-frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
+frozen by `--spec mtp|dflash|dflash2|eagle3` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined
 with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
 and prefill remain outside speculative acceleration. A later request cannot enable a capability
@@ -219,17 +225,45 @@ The endpoint supports:
 - the top-level `reasoning_effort` field;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
   `chat_template_kwargs`;
-- Assistant `reasoning_content` and `reasoning` history aliases.
+- Assistant `reasoning_content` and `reasoning` history aliases;
+- constrained output on the generated content, accepted on Chat Completions, Responses and
+  Messages: `response_format: {"type": "json_object"}` or
+  `{"type": "json_schema", "json_schema": {"name": ..., "schema": {...}}}`, the Responses
+  `text.format` equivalent, the Anthropic `output_config.format` schema form, GBNF through
+  `structured_outputs: {"grammar": "<GBNF source>"}`, a finite string set through
+  `{"choice": ["yes", "no"]}`, and a regular expression through `{"regex": "[a-z]+"}`. The object
+  takes exactly one of those three keys. The constraint applies after the model's
+  reasoning phase. Supported schema keywords and the exact semantics are in
+  [constrained decoding](maintainer/constrained-decoding.md); a request is refused when the
+  constraint cannot be combined with what it asks for (active tools, custom stops, raw or
+  special-preserving output or non-default EOS). A constrained `mtp` request keeps drafting — every verify
+  position gets its own legal set, and a draft the constraint forbids is simply not accepted — and a
+  schema error names the field the client sent plus the JSON Pointer that failed.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
+behavior. This includes `strict` JSON Schema enforcement on function tools, nonzero `logit_bias`, requested log probabilities,
 audio/file input or audio output, `strict:true`, required or named tool choice,
 `parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
-Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
-`guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
-as unknown hints.
+Tool declarations and their selection are separate facts. `tools` declares what the model may call;
+`tool_choice` decides what this request accepts: `auto`, `none`, `required`, `{"type":"function",...}`
+for one named function, or `allowed_tools` with `mode: auto|required` and a `tools` list. Naming one
+function also forbids parallel calls, matching both protocols' semantics. `parallel_tool_calls: false`
+caps the call count at one, and `strict: true` on a function makes the generated arguments satisfy
+that function's declared JSON Schema. `tool_constraints: auto|basic` (default `basic`) decides whether
+a request with ordinary `auto` tools is also constrained structurally; declarations always reach the
+prompt either way. JSON output may be combined with active tools — the model answers in JSON or calls
+a tool, and the response states which branch the answer took — while GBNF, choice and regex describe
+one language and are refused with tools. When the client asks for phase timings, the constraint
+observation reports the compile-cache outcome, mask work and that branch, as subintervals of the
+timings already reported. A call may follow ordinary content under `auto`; under `required` it starts the
+answer. Custom tools, hosted tools and `strict:true` on a tool whose schema is outside the supported
+subset are still refused.
+
+The other constrained-decoding aliases llama.cpp and vLLM used (`grammar`, `guided_json`,
+`guided_regex`, `guided_choice`, and `guided_grammar`) are refused with a pointer to the standard
+JSON output formats or `structured_outputs.grammar` instead of being treated as unknown hints.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `top_logprobs:0`, `verbosity:"medium"`, empty legacy tool controls,
@@ -917,6 +951,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
+| `--profile FILE` | load base options from a `ninfer_serve_profile` JSON file (written by `ninfer-optimizer`); every other command-line flag overrides it | unset |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--expert-cache auto\|MiB` | device cache of host-resident routed experts (Qwen4Exp only); `auto` takes the memory left after the KV floor | `auto` |
@@ -939,9 +974,10 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
-| `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..7`, the longest draft; DFlash/DFlash2 `1..15` | MTP `7`; otherwise unset |
-| `--fixed-draft` | MTP only: always draft exactly `N` instead of adapting the length of a single request's rounds | off |
+| `--spec mtp\|dflash\|dflash2\|eagle3` | speculative backend | off |
+| `--draft-tokens N` | MTP `1..7`, the longest draft; DFlash/DFlash2/EAGLE3 `1..15` | MTP `7`; otherwise unset |
+| `--fixed-draft` | MTP/EAGLE3: always draft exactly `N` instead of adapting the length of a single request's rounds | off |
+| `--draft-tree N` | EAGLE3 static draft-tree root width; only `1` (a chain) is implemented | `1` |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--lookup-drafts off\|auto\|always` | MTP only: add prompt-lookup (suffix) drafts; `auto` uses one only where it is predicted to commit more than the MTP drafts, or (with a window above 7) more than the measured cost ratio of an ordinary round, `always` uses every proposal (measurement). With `--draft-tokens` above 7 (requires `--fixed-draft`) every round is a lookup round, the MTP draft phases are skipped, and a round with no profitable proposal decodes ordinarily | off |
 | `--lookup-min-match N` | shortest suffix match that may produce a lookup proposal (`3..32`) | `8` |
@@ -950,6 +986,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
+| `--no-auto-system-shared-prefix` | keep the leading system/developer run from publishing an automatic shared-prefix candidate, so agent siblings stop sharing that head without a client marker | frontier candidate on |
 | `--kv-stream` | let `--kv-capacity` be below `--max-context`: each request owns an equal share, borrows idle shares (returned when another request needs its share), and beyond that moves older full pages to Host KV, copying them back per layer as each step needs them; needs Host KV capacity, and admission reserves Host KV for the part of a request's whole context (prompt plus output limit) beyond its share, so a request waits (or is rejected if it can never fit) rather than failing mid-generation; rejects DFlash and CausalScoring. Flash-Next (QSA) keeps a Device copy of streamed pages' index records and reads only the selected tokens' K/V from Host. the context cache works as usual: requests capture and publish checkpoints, and reuse (resume, branch, shared prefix) leaves older pages in Host KV instead of restoring them | off |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |

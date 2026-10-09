@@ -56,6 +56,13 @@ struct DFlashPersistentLayout {
     }
 };
 
+// EAGLE3 prefill: the three concatenated target layers captured over one prefill chunk and their
+// positions, consumed in the same chunk to build the draft KV.
+struct Eagle3PrefillLayout {
+    TensorLayout features;
+    TensorLayout positions;
+};
+
 // Qwen4Exp Program resources: the routed-expert cache, the prefill layer bank and PLE buffers.
 struct Qwen4PersistentLayout {
     TensorLayout slot_of;  // I32 [cache_layers * experts]
@@ -85,11 +92,13 @@ struct PersistentLayout {
     qwen3_5::StateImageDeviceLayout state_images;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
+    std::optional<Eagle3PrefillLayout> eagle3;
     qwen3_5::RoundStateLayout round;
     TensorLayout prefill_hidden;
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
+    std::optional<TensorLayout> grammar_masks;
     std::optional<Qwen4PersistentLayout> qwen4;
     // Pinned Host cost of one complete Main Text KV page group, taken from the same planned
     // geometry the Device pool binds. The Host RAM budget compares one StateImage against the Main
@@ -137,6 +146,8 @@ struct SequencePlanningInputs {
     std::uint32_t prefill_chunk             = 0; // service unit; the width beside decode work
     std::uint32_t prefill_width             = 0; // widest chunk, a multiple of prefill_chunk
     std::uint32_t draft_window              = 0;
+    // EAGLE3 static draft-tree root width (1 is a chain).
+    std::uint32_t tree_width                = 1;
     bool adaptive_draft                     = false;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     LookupDraftMode lookup_drafts           = LookupDraftMode::Off;
@@ -170,6 +181,8 @@ struct SequencePlanImpl {
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t prefill_width             = 0;
     std::uint32_t draft_window              = 0;
+    // EAGLE3 static draft-tree root width (1 is a chain).
+    std::uint32_t tree_width                = 1;
     bool adaptive_draft                     = false;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     LookupDraftMode lookup_drafts           = LookupDraftMode::Off;

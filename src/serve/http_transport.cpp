@@ -2,6 +2,7 @@
 
 #include "serve/http_server.h"
 #include "serve/request_validation.h"
+#include "text/json_input.h"
 
 #if defined(__linux__)
 #    include <netinet/tcp.h>
@@ -29,9 +30,15 @@ void set_socket_option(socket_t socket, int level, int option, const T& value) n
 } // namespace
 
 RequestJson parse_json_body(const httplib::Request& request) {
+    // Parse once, retaining schema locations whose numeric spelling would change value: a schema
+    // that cannot round-trip through the JSON number representation is refused here, before it can
+    // describe a language the engine could not have generated.
+    text::ParsedJsonNumbers parsed;
     try {
-        return RequestJson::parse(request.body);
+        parsed = text::parse_json_numbers(request.body);
     } catch (const std::exception&) { bad_request("request body is not valid JSON"); }
+    validate_schema_number_input(parsed);
+    return std::move(parsed.value);
 }
 
 bool client_disconnected(const httplib::Request& request) { return request.is_connection_closed(); }
@@ -82,6 +89,12 @@ void configure_http_server_socket(socket_t socket) noexcept {
     httplib::default_socket_options(socket);
 #if defined(__linux__)
     const int enabled = 1;
+    // httplib sets only SO_REUSEPORT. Linux allows binding over a port's
+    // TIME_WAIT connections only when the old and new sockets both set
+    // SO_REUSEADDR, or both set SO_REUSEPORT under one uid. Without this, a
+    // server using SO_REUSEADDR cannot take the port for about a minute after
+    // NInfer stops, and NInfer cannot bind for as long after such a server stops.
+    set_socket_option(socket, SOL_SOCKET, SO_REUSEADDR, enabled);
     set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, kKeepAliveIdleSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);

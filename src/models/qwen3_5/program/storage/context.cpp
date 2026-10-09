@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
+#include "core/nvtx.h"
 
 #include <algorithm>
 #include <array>
@@ -905,13 +906,26 @@ ProgramImpl::shared_prefix_summary(const SharedPrefixState& shared) const {
 }
 
 PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence, runtime::PrefillPace pace,
-                                             runtime::ExecutionTiming* failed_timing) {
+                                             runtime::ExecutionTiming* failed_timing,
+                                             runtime::TokenMaskProvider* masks) {
     if (pending_transaction_ || !valid_sequence(sequence)) {
         throw std::logic_error("prefill sequence capability is invalid");
     }
     const std::uint32_t lane = ContractAccess::lane(sequence).value;
     if (requests[lane].lifecycle != Lifecycle::Prefilling) {
         throw std::logic_error("prefill advance requires a prefilling sequence");
+    }
+    // The prefill round samples the first generated token, so the lane's sampling config has to
+    // carry the mask before that round runs. A prefill step serves one sequence, so the constraint
+    // row is 0, and refreshing per step keeps the copy current after a resumed prefill.
+    grammar_dead_positions[0] = 0;
+    if (masks != nullptr && masks->constrained(0)) {
+        auto& host         = *static_cast<qwen3_5::PrefillRoundHost*>(round_host->data());
+        host.sampling      = requests[lane].sampling_host;
+        host.sampling.mask = fill_grammar_mask(masks, 0, {});
+        Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+        CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &host.sampling, sizeof(host.sampling),
+                                   cudaMemcpyHostToDevice, device.stream));
     }
     try {
         runtime::PrefillStepResult step = advance_prefill_raw(lane, pace, failed_timing);
@@ -1393,18 +1407,23 @@ void ProgramImpl::release_active_shared_references(SequenceState& sequence) noex
 
 qwen3_5::PagedKVCache* ProgramImpl::backend_kv_cache() noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
+    if (speculative_backend == SpeculativeBackend::Eagle3) { return decoder->eagle3_cache(); }
     if (dflash && dflash->full) { return &*dflash->full; }
     return nullptr;
 }
 
 const qwen3_5::PagedKVCache* ProgramImpl::backend_kv_cache() const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
+    if (speculative_backend == SpeculativeBackend::Eagle3) { return decoder->eagle3_cache(); }
     if (dflash && dflash->full) { return &*dflash->full; }
     return nullptr;
 }
 
 std::uint32_t ProgramImpl::backend_kv_valid(const SequenceState& sequence) const noexcept {
-    if (speculative_backend == SpeculativeBackend::Mtp) { return sequence.mtp_kv_valid; }
+    if (speculative_backend == SpeculativeBackend::Mtp ||
+        speculative_backend == SpeculativeBackend::Eagle3) {
+        return sequence.mtp_kv_valid;
+    }
     if (speculative_backend == SpeculativeBackend::DFlash) {
         return sequence.dflash_context_frontier;
     }
@@ -1488,6 +1507,8 @@ qwen3_5::KVHostStaging* ProgramImpl::stage_text_kv(std::span<const std::uint32_t
     // Sparse attention reads only its selected tokens: a decode round reads Host K/V in place
     // rather than copying every Host page.
     if (!decoder->text_kv_staging || decoder->text_kv.has_qsa_index()) { return nullptr; }
+    nvtx::ScopedRange staging_range(nvtx::Name::ContextKvStaging, nvtx::Category::Control,
+                                    static_cast<std::uint64_t>(lanes.size()));
     std::array<qwen3_5::KVHostStaging::RowPages, kMaximumConcurrency> rows{};
     if (lanes.size() > rows.size()) { throw std::logic_error("KV staging batch is too wide"); }
     for (std::size_t index = 0; index < lanes.size(); ++index) {
@@ -1903,6 +1924,7 @@ std::optional<std::uint32_t> ProgramImpl::device_kv_lease_settlement_tokens(
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                             std::uint32_t backend_tokens) {
+    nvtx::ScopedRange mapping_range(nvtx::Name::ContextKvMapping, nvtx::Category::Control);
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity) {
         throw std::logic_error("KV materialization request is outside the sequence bundle");
     }
@@ -1955,6 +1977,7 @@ void ProgramImpl::maybe_audit_page_pools() const {
 
 void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                      std::uint32_t backend_tokens) {
+    nvtx::ScopedRange commit_range(nvtx::Name::ProgramCommit, nvtx::Category::Control);
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity ||
         (backend_tokens != 0 && !sequence.kv->backend)) {
         throw std::logic_error("KV commit request is outside the sequence bundle");
@@ -2083,6 +2106,16 @@ qwen3_5::PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& sequence
         throw std::logic_error("sequence has no active MTP KV execution mapping");
     }
     return decoder->mtp_cache()->execution_view(
+        backend_kv_addresses->execution_row(*sequence.kv->backend));
+}
+
+qwen3_5::PagedKVCacheView ProgramImpl::eagle3_kv_view(const SequenceState& sequence) const {
+    if (speculative_backend != SpeculativeBackend::Eagle3) { return {}; }
+    if (decoder->eagle3_cache() == nullptr || !sequence.kv || !sequence.kv->backend ||
+        !backend_kv_addresses->active(*sequence.kv->backend)) {
+        throw std::logic_error("sequence has no active EAGLE3 KV execution mapping");
+    }
+    return decoder->eagle3_cache()->execution_view(
         backend_kv_addresses->execution_row(*sequence.kv->backend));
 }
 

@@ -39,9 +39,16 @@ PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
             ContractAccess::make_sequence(this, runtime::LaneId{lane}, lane_epochs[lane]);
     }
     pending_transaction_ = transaction;
-    return ContractAccess::make_pending(
+    auto pending         = ContractAccess::make_pending(
         this, transaction.id, std::span<const SequenceHandle>(handles.data(), lanes.size()),
         round.tokens, round.row_counts, round.row_stride, round.timing);
+    // A row fails only when its round actually consumed a position the constraint left empty.
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const auto count = round.row_counts.empty() ? 1 : round.row_counts[row];
+        ContractAccess::constraint_failed(pending, row,
+                                          (grammar_dead_positions[row] & ((1u << count) - 1)) != 0);
+    }
+    return pending;
 }
 
 PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step) {
@@ -146,6 +153,9 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         return StartResult{.sequence = handle};
     } catch (...) {
         if (destination && *destination < max_concurrency) {
+            // Startup may have queued work before a later publication check failed.
+            // Complete it before returning its buffers, pages or execution row to the pools.
+            device.synchronize();
             const std::uint32_t lane = *destination;
             if (active_continuations[lane] < continuation_capacity) {
                 clear_lane_best_effort(active_sequence(lane), requests[lane]);
@@ -160,7 +170,8 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
 
 PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> members,
                                  std::span<const runtime::RoundBudget> budgets,
-                                 runtime::ExecutionTiming* failed_timing) {
+                                 runtime::ExecutionTiming* failed_timing,
+                                 runtime::TokenMaskProvider* masks) {
     if (pending_transaction_ || members.empty() || members.size() > max_concurrency ||
         budgets.size() != members.size()) {
         throw std::invalid_argument("decode membership is invalid");
@@ -180,7 +191,8 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> members,
     }
     const auto lane_span = std::span<const std::uint32_t>(lanes.data(), members.size());
     try {
-        runtime::BatchedGeneratedRound round = decode_raw(lane_span, budgets, failed_timing);
+        runtime::BatchedGeneratedRound round =
+            decode_raw(lane_span, budgets, failed_timing, masks);
         if (failed_timing != nullptr) { *failed_timing += round.timing; }
         return wrap_pending(lane_span, std::move(round));
     } catch (...) {
@@ -260,7 +272,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             sequence.prefix_identity.size() != sequence.ledger_frontier ||
             sequence.prefix_digests.size() != sequence.ledger_frontier ||
             sequence.text_kv_valid != sequence.execution_frontier ||
-            (speculative_backend == SpeculativeBackend::Mtp &&
+            ((speculative_backend == SpeculativeBackend::Mtp ||
+              speculative_backend == SpeculativeBackend::Eagle3) &&
              sequence.mtp_kv_valid != sequence.execution_frontier) ||
             (is_masked_draft_backend(speculative_backend) &&
              sequence.dflash_context_frontier > sequence.execution_frontier) ||
@@ -354,6 +367,9 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     decoder->text_kv,
                     decoder->mtp_cache(),
                     dflash ? &*dflash : nullptr,
+                    eagle3_prefill ? &*eagle3_prefill : nullptr,
+                    eagle3_kv_view(sequence),
+                    decoder->eagle3_cache(),
                     cursor,
                     nullptr,
                     nullptr,
@@ -370,14 +386,16 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
                 const execution::PrefillChunkResult result = execution::prefill_text_chunk(
-                    schedule_state, sequence.ledger, count, std::nullopt, false);
+                    schedule_state, sequence.ledger, count, std::nullopt, false,
+                    sequence.rope_delta);
                 if (result.finalized || result.processed_tokens == 0 ||
                     result.processed_tokens > count) {
                     throw std::logic_error("forced-token prefill made invalid progress");
                 }
                 cursor += result.processed_tokens;
                 sequence.text_kv_valid = cursor;
-                if (speculative_backend == SpeculativeBackend::Mtp) {
+                if (speculative_backend == SpeculativeBackend::Mtp ||
+                    speculative_backend == SpeculativeBackend::Eagle3) {
                     sequence.mtp_kv_valid = cursor;
                 } else if (is_masked_draft_backend(speculative_backend)) {
                     sequence.dflash_context_frontier = cursor;
@@ -728,7 +746,8 @@ bool ProgramImpl::salvage_continuation(SequenceState& state, RequestControl& req
     } else if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Finishable) {
         frontier = state.execution_frontier;
         if (frontier < kSalvageMinFrontier || state.text_kv_valid != frontier) { return false; }
-        if (speculative_backend == SpeculativeBackend::Mtp) {
+        if (speculative_backend == SpeculativeBackend::Mtp ||
+            speculative_backend == SpeculativeBackend::Eagle3) {
             if (state.mtp_kv_valid + 1 < frontier) { return false; }
         } else if (speculative_backend == SpeculativeBackend::DFlash) {
             if (state.dflash_context_frontier < frontier) { return false; }
@@ -763,6 +782,9 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         out.status = runtime::ConsumeStatus::Consumed;
         return out;
     }
+    // Cancellation can arrive after activation and before the first prefill unit has waited
+    // for its uploads and initialization. Settle that work before releasing reusable resources.
+    device.synchronize();
     if (!clear_lane_strict(state, request)) { return out; }
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);

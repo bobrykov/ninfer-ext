@@ -1,3 +1,4 @@
+#include "product/constraint_observation.h"
 #include "serve/openai_responses.h"
 
 #include "serve/generation_service.h"
@@ -97,7 +98,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"service_tier", "default"},
         {"store", request.store},
         {"temperature", runtime.temperature},
-        {"text", Json{{"format", Json{{"type", "text"}}}}},
+        {"text", Json{{"format", request.text_format}}},
         {"tool_choice", request.tool_choice},
         {"tools", request.tools},
         {"top_logprobs", 0},
@@ -205,6 +206,9 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
              {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
              {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};
     built.body = std::move(response);
+    if (outcome.constraint) {
+        built.body["constraint"] = product::constraint_observation_json(outcome.constraint);
+    }
     return built;
 }
 

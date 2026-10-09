@@ -1,4 +1,5 @@
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/argmax.h"
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -11,6 +12,8 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -104,6 +107,8 @@ struct SparseAcceptSuite {
     const int kSparseColumns;
     const int kSparseBatch;
     std::size_t observed_workspace = 0;
+    std::vector<std::uint32_t> masks;
+    static constexpr int mask_words = (kSparseTokenDomain + 31) / 32;
 
     SparseAcceptSuite(int drafts, int batch)
         : kSparseDrafts(drafts), kSparseColumns(drafts + 1), kSparseBatch(batch) {}
@@ -154,6 +159,11 @@ struct SparseAcceptSuite {
                                                   const std::vector<std::int32_t>& token_counts,
                                                   const std::vector<std::int32_t>& drafts) {
         const auto adjusted = [&](int token) {
+            if (!masks.empty() &&
+                !(masks[(row * kSparseColumns + column) * mask_words + token / 32] &
+                  (1u << (token % 32)))) {
+                return -std::numeric_limits<double>::infinity();
+            }
             double value = bf16_to_f32(logits[sparse_logit_index(row, column, token)]);
             int count    = token_counts[static_cast<std::size_t>(row) * kSparseTokenDomain + token];
             for (int previous = 0; previous < column; ++previous) {
@@ -392,6 +402,16 @@ struct SparseAcceptSuite {
             device_configs[static_cast<std::size_t>(row)].token_counts =
                 static_cast<std::int32_t*>(d_token_counts.p) +
                 static_cast<std::size_t>(row) * kSparseTokenDomain;
+        }
+        std::optional<DeviceBuffer> d_masks;
+        if (!masks.empty()) {
+            d_masks.emplace(to_device(masks));
+            for (int row = 0; row < kSparseBatch; ++row) {
+                device_configs[static_cast<std::size_t>(row)].mask = {
+                    static_cast<const std::uint32_t*>(d_masks->p) +
+                        row * kSparseColumns * mask_words,
+                    mask_words};
+            }
         }
         DeviceBuffer d_configs = to_device(device_configs);
 
@@ -810,6 +830,45 @@ struct SparseAcceptSuite {
             proposal_q, extents, lengths, anchors, configs, token_counts,
             ops::SpeculativeAcceptExecutionEnvelope{.all_rows_greedy_without_penalties = false});
     }
+
+    // Every column carries its own mask, so acceptance and residual correction both run against
+    // the restricted distribution: a draft outside it is corrected instead of committed.
+    int grammar_mask_case() {
+        std::vector<int> targets(kSparseColumns * kSparseBatch, 42),
+            drafts(kSparseDrafts * kSparseBatch), ids(kSparseCandidates * kSparseDrafts * kSparseBatch),
+            extents(kSparseBatch, kSparseDrafts), lengths(kSparseBatch, 70),
+            anchors(kSparseBatch, 0);
+        std::vector<std::uint16_t> logits(
+            static_cast<std::size_t>(kSparsePhysicalRows) * kSparseColumns * kSparseBatch,
+            f32_to_bf16(12.0f));
+        std::vector<float> q(ids.size(), 0.0f);
+        std::vector<ops::SamplingConfig> configs(kSparseBatch);
+        std::vector<int> history(kSparseTokenDomain * kSparseBatch, 0);
+        masks.assign(kSparseColumns * kSparseBatch * mask_words, 0);
+        const int a = kSparseTokenDomain - 2, b = kSparseTokenDomain - 1, x = 42;
+        for (int row = 0; row < kSparseBatch; ++row) {
+            configs[row].temperature = row < kSparseBatch / 2 ? 0.0f : 1.0f;
+            configs[row].seed        = 8123 + row;
+            for (int col = 0; col < kSparseColumns; ++col) {
+                for (int token : {a, b}) {
+                    masks[(row * kSparseColumns + col) * mask_words + token / 32] |=
+                        1u << (token % 32);
+                    logits[sparse_logit_index(row, col, token)] = f32_to_bf16(0.0f);
+                }
+                if (col < kSparseDrafts) {
+                    const int base = sparse_candidate_index(row, col, 0);
+                    for (int c = 0; c < 16; ++c) ids[base + c] = c + 100;
+                    ids[base]     = a;
+                    ids[base + 1] = x;
+                    q[base] = q[base + 1]             = 0.5f;
+                    drafts[row * kSparseDrafts + col] = (row + col) % 2 ? x : a;
+                }
+            }
+        }
+        // p(a)=p(b)=.5, q(a)=q(x)=.5: a accepts, invalid x corrects to b with probability 1.
+        return execute_sparse_accept_case("sparse grammar mask", targets, logits, drafts, ids, q,
+                                          extents, lengths, anchors, configs, history, {false});
+    }
 };
 
 AcceptExpected accept_state_oracle(const std::vector<std::int32_t>& drafts, std::int32_t accepted,
@@ -980,6 +1039,28 @@ int deterministic_sampling_case() {
     return execute_accept_case("speculative sampling deterministic support", targets, logits_bits,
                                physical_rows, drafts, initial_length, token_domain, config,
                                token_counts, expected);
+}
+
+int grammar_onehot_case(int domain, float temperature) {
+    constexpr int k = 3;
+    const std::vector<int> drafts{11, 12, 13};
+    const std::vector<int> targets(k + 1, 0);
+    std::vector<std::uint16_t> logits((domain + 2) * (k + 1), f32_to_bf16(12.0f));
+    const int words = (domain + 31) / 32;
+    std::vector<std::uint32_t> masks(words * (k + 1), 0);
+    for (int col = 0; col <= k; ++col) {
+        // The first two positions allow their draft; the last allows neither, so it is corrected.
+        const int allowed = col < 2 ? drafts[static_cast<std::size_t>(col)] : 51;
+        masks[col * words + allowed / 32] |= 1u << (allowed % 32);
+        logits[static_cast<std::size_t>(col) * (domain + 2) + allowed] = f32_to_bf16(-2.0f);
+    }
+    auto device_masks = to_device(masks);
+    ops::SamplingConfig config;
+    config.temperature = temperature;
+    config.mask        = {static_cast<const std::uint32_t*>(device_masks.p), words};
+    const auto expected = accept_state_oracle(drafts, 2, 51, 73);
+    return execute_accept_case("one-hot grammar mask", targets, logits, domain + 2, drafts, 73,
+                               domain, config, std::vector<int>(domain, 0), expected);
 }
 
 int greedy_penalty_case(int token_domain) {
@@ -1178,6 +1259,112 @@ int remap_case(int token_count) {
     return failures;
 }
 
+int mask_logits_case(int rows, int batch, int rounds) {
+    // Exact oracle for draft-tree top-k: repeated argmax with masking must yield the rows sorted
+    // by descending value with lower-id tie-breaks, and masked elements must read back -inf.
+    std::vector<std::uint16_t> logits(static_cast<std::size_t>(rows) * batch);
+    for (int b = 0; b < batch; ++b) {
+        for (int r = 0; r < rows; ++r) {
+            const float value =
+                static_cast<float>((7 * r + 11 * b + (r % 5)) % 13) - static_cast<float>(r) / 64.0f;
+            logits[static_cast<std::size_t>(b) * rows + r] = f32_to_bf16(value);
+        }
+    }
+    std::vector<std::vector<std::int32_t>> expected(batch);
+    for (int b = 0; b < batch; ++b) {
+        std::vector<std::int32_t> order(rows);
+        std::iota(order.begin(), order.end(), 0);
+        const auto* column = logits.data() + static_cast<std::size_t>(b) * rows;
+        std::stable_sort(order.begin(), order.end(), [&](std::int32_t x, std::int32_t y) {
+            const float vx = bf16_to_f32(column[x]);
+            const float vy = bf16_to_f32(column[y]);
+            return vx != vy ? vx > vy : x < y;
+        });
+        expected[b].assign(order.begin(), order.begin() + rounds);
+    }
+
+    DeviceBuffer d_logits = to_device(logits);
+    GuardedDeviceBuffer d_selected(batch * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_winner(batch * sizeof(std::int32_t));
+    Tensor logits_tensor(d_logits.p, DType::BF16, {rows, batch});
+    Tensor selected_tensor(d_selected.data(), DType::I32, {batch});
+    Tensor winner_tensor(d_winner.data(), DType::I32, {batch});
+    DeviceContext context;
+    int failures = 0;
+    const std::string label =
+        "mask logits R=" + std::to_string(rows) + " B=" + std::to_string(batch);
+    std::vector<std::int32_t> winners(static_cast<std::size_t>(rounds) * batch);
+    for (int round = 0; round < rounds; ++round) {
+        ops::argmax(logits_tensor, winner_tensor, rows, context.stream);
+        cuda_synchronize();
+        const std::vector<std::int32_t> got =
+            from_device<std::int32_t>(d_winner.data(), static_cast<std::size_t>(batch));
+        for (int b = 0; b < batch; ++b) {
+            winners[static_cast<std::size_t>(round) * batch + b] = got[static_cast<std::size_t>(b)];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(selected_tensor.data, winner_tensor.data,
+                                   selected_tensor.bytes(), cudaMemcpyDeviceToDevice,
+                                   context.stream));
+        ops::mask_selected_logits(logits_tensor, selected_tensor, context.stream);
+        cuda_synchronize();
+    }
+    std::vector<std::int32_t> want(winners.size());
+    for (int b = 0; b < batch; ++b) {
+        for (int round = 0; round < rounds; ++round) {
+            want[static_cast<std::size_t>(round) * batch + b] = expected[b][round];
+        }
+    }
+    failures += verify_exact((label + " winners").c_str(), winners, want);
+    const std::vector<std::uint16_t> masked =
+        from_device<std::uint16_t>(d_logits.p, logits.size());
+    std::vector<std::uint16_t> want_masked = logits;
+    for (int b = 0; b < batch; ++b) {
+        for (int round = 0; round < rounds; ++round) {
+            want_masked[static_cast<std::size_t>(b) * rows + expected[b][round]] = 0xFC00U;
+        }
+    }
+    failures += verify_exact((label + " masked").c_str(), masked, want_masked);
+    failures += d_selected.verify_guards((label + " selected guards").c_str());
+    failures += d_winner.verify_guards((label + " winner guards").c_str());
+    return failures;
+}
+
+int tree_winners_case(int batch, int tree_width) {
+    // Exact oracle: lowest maximizing index per sequence-major group.
+    std::vector<std::int32_t> accepted(static_cast<std::size_t>(batch) * tree_width);
+    std::vector<std::int32_t> expected(batch);
+    for (int s = 0; s < batch; ++s) {
+        std::int32_t best_t = 0;
+        std::int32_t best    = -1;
+        for (int t = 0; t < tree_width; ++t) {
+            const std::int32_t value =
+                static_cast<std::int32_t>((3 * s + 5 * t + (t == 2 ? 4 : 0)) % 4);
+            accepted[static_cast<std::size_t>(s) * tree_width + t] = value;
+            if (value > best) {
+                best   = value;
+                best_t = t;
+            }
+        }
+        expected[s] = best_t;
+    }
+    DeviceBuffer d_accepted = to_device(accepted);
+    GuardedDeviceBuffer d_winners(batch * sizeof(std::int32_t));
+    Tensor accepted_tensor(d_accepted.p, DType::I32,
+                           {batch * tree_width});
+    Tensor winners_tensor(d_winners.data(), DType::I32, {batch});
+    DeviceContext context;
+    ops::select_tree_winners(accepted_tensor, winners_tensor, tree_width, context.stream);
+    cuda_synchronize();
+    const std::string label = "tree winners B=" + std::to_string(batch) + " T=" +
+                              std::to_string(tree_width);
+    int failures = verify_exact((label + " winners").c_str(),
+                                from_device<std::int32_t>(d_winners.data(), batch), expected);
+    failures += verify_exact((label + " accepted unchanged").c_str(),
+                             from_device<std::int32_t>(d_accepted.p, accepted.size()), accepted);
+    failures += d_winners.verify_guards((label + " guards").c_str());
+    return failures;
+}
+
 int transforms_conformance() {
     int failures = 0;
     for (int k = 1; k <= 15; ++k)
@@ -1190,6 +1377,9 @@ int transforms_conformance() {
     failures += remap_case(1);
     failures += remap_case(15);
     failures += remap_case(120);
+    for (const int batch : {1, 8}) failures += mask_logits_case(37, batch, 4);
+    failures += tree_winners_case(3, 2);
+    failures += tree_winners_case(8, 4);
     return failures;
 }
 
@@ -1229,6 +1419,8 @@ int main(int argc, char** argv) {
     failures += greedy_accept_case(5, 2);
     failures += greedy_accept_case(5, 5);
     failures += greedy_accept_case(15, 7, 257);
+    for (int domain : {64, 257, 248077})
+        for (float temperature : {0.0f, 1.0f}) failures += grammar_onehot_case(domain, temperature);
     failures += greedy_penalty_case(64);
     failures += greedy_penalty_case(257);
     failures += deterministic_sampling_case();
@@ -1263,6 +1455,7 @@ int main(int argc, char** argv) {
     for (int k : {1, 7, 15}) {
         SparseAcceptSuite suite(k, 8);
         failures += suite.sparse_general_mixed_case();
+        failures += SparseAcceptSuite(k, 8).grammar_mask_case();
         failures += suite.sparse_greedy_direct_case(0, true);
         failures += SparseAcceptSuite(k, 1).repeated_history_case(false);
         failures += SparseAcceptSuite(k, 1).repeated_history_case(true);

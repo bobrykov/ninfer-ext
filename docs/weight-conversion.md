@@ -69,6 +69,13 @@ These names select conversion choices. Runtime execution is selected from the ar
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
 it does not select kernels.
 
+`qwen3_6_35b_a3b_nvfp4` accepts either expert layout: the compressed-tensors spelling
+(`weight_packed`/`weight_global_scale`) or the NVIDIA ModelOpt spelling
+(`weight`/`weight_scale`/`weight_scale_2`/`input_scale`). The same checkpoint directory can be
+passed as both `--model` and the `quantized` source, in which case the NVFP4 experts, the per-tensor
+FP8 projections and the packed vocabulary head are all read from it. The NVFP4 sparse-MoE route
+requires `AllowA4` on every expert input, so the imported input divisors are part of the model.
+
 `qwen3_8_flash_next_nvfp4` converts Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`) directly from
 [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4). Each
 layer's routed experts are stored expert-major so that one expert is a few contiguous spans, and
@@ -129,10 +136,18 @@ python3 -m tools.convert \
   --out models/qwen3_8_27b_nvfp4.ninfer
 ```
 
-MTP and Vision use the main source. DFlash and DFlash2 use the corresponding named source, supplied
-as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain several optional
-components; the Engine loads only the ones selected at startup, including at most one speculative
-backend. Component availability and startup selection are independent.
+MTP and Vision use the main source. DFlash, DFlash2 and EAGLE3 use the corresponding named source,
+supplied as `--source dflash=PATH`, `--source dflash2=PATH` or `--source eagle3=PATH`. The EAGLE3
+component converts either published export — SpecForge's flat `LlamaForCausalLMEagle3` (for example
+`jiapingW/Qwen3.5-35B-A3B-Eagle3-Specforge`, layer named `midlayer.`) or the `speculators`/vLLM
+layout (`Eagle3LlamaForCausalLM` / `Eagle3DraftModel`, geometry under `transformer_layer_config`,
+layer named `layers.0.`, aux layers declared as `eagle_aux_hidden_state_layer_ids`) — into `eagle3/*`
+parameters, inheriting the target's token embedding and tokenizer; see
+[EAGLE3](maintainer/eagle3.md). The declared aux layers and a declared `partial_rotary_factor` are
+stored in the artifact, and a second copy of the target embedding in a `speculators` export is
+ignored. An artifact may contain several
+optional components; the Engine loads only the ones selected at startup, including at most one
+speculative backend. Component availability and startup selection are independent.
 
 ## Change part of a recipe
 
@@ -232,6 +247,19 @@ They permit choices; they do not force a kernel to use the lowest precision. A f
 shares one activation across several projections must respect the intersection of their
 permissions. `recipe.use(parameter, input_name, ...)` can set one mathematical input independently;
 the names are available in `parameter.inputs`.
+
+The Qwen3.6-27B and Qwen3.8-27B groupwise-int recipes (`qwen3_6_27b`, `qwen3_8_27b`) declare
+`AllowA8` for the Q4 MLP gate/up projections, because the fused gate/up projection has a Q4 W4A8
+prefill route; the other projections stay `A16Only`. A fresh conversion therefore emits the
+permission. An artifact converted before this change, or the published upstream artifact, keeps
+`A16Only` and can be enabled without reconverting or re-downloading, since its Q4 codes and scales
+are the same as A16: [`set_activation_policy`](../tools/artifact/set_activation_policy.py) rewrites
+only the per-Use metadata.
+
+```bash
+python3 -m tools.artifact.set_activation_policy in.ninfer out.ninfer \
+  --parameter '*/mlp/gate' --parameter '*/mlp/up' --policy AllowA8
+```
 
 An NVFP4 A4 input requires a positive finite activation divisor. `import_encoded` obtains it from
 the selected source, or a recipe supplies it through
@@ -510,6 +538,25 @@ codes/scales; the method should not duplicate that byte-layout logic. Direct out
 working set. `--rows-per-chunk` defaults to 512; custom methods own how they use it.
 
 ## Resources, files and inspection
+
+### Attach an existing DFlash2 component
+
+When both inputs are v3 artifacts with identical text configs and tokenizer bytes, a Linux
+offline copy can add a donor's DFlash2 component to a target that does not yet contain one:
+
+```bash
+python3 -m tools.artifact.attach_dflash2 \
+  --base models/my_target.ninfer --donor models/target_with_dflash2.ninfer \
+  --out models/my_target_with_dflash2.ninfer
+```
+
+This preserves every encoded target object, existing binding, resource and proposal head. It
+copies the donor's draft objects without requantization, remaps physical references while retaining
+shared parents and logical ranges, and uses the base target's output-head activation policy and
+auxiliaries. Existing output files are not overwritten. Every output object is read back and
+checked against its source SHA-256; `<output>.attach.json` records the results. A successful copy
+establishes byte preservation and structural compatibility, not draft acceptance or inference
+quality for a different target checkpoint. Qualify the resulting artifact through the Engine.
 
 Text includes `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and
 `generation_config.json`. Vision adds its image and video processor configs. Resources come from

@@ -44,7 +44,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), prefill_width(plan.prefill_width),
-      draft_window(plan.draft_window),
+      draft_window(plan.draft_window), tree_width(plan.tree_width),
       adaptive_draft(plan.adaptive_draft), plain_mtp_batches(plan.plain_mtp_batches),
       speculative_backend(plan.speculative_backend),
       lookup_drafts(plan.lookup_drafts), lookup_min_match(plan.lookup_min_match),
@@ -57,8 +57,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       work(DeviceSpan{workspace_storage.base(), plan.workspace.permanent_capacity}),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
-      round_host(plan.causal_scoring ? std::nullopt
-                                     : std::make_optional<PinnedHostBuffer>(sizeof(TokenId))),
+      round_host(plan.causal_scoring
+                     ? std::nullopt
+                     : std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::PrefillRoundHost))),
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),
@@ -69,7 +70,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::OrdinaryDecodeIngress) +
                                                      sizeof(qwen3_5::OrdinaryDecodeEgress))
               : std::nullopt),
-      mtp_host(plan.speculative_backend == SpeculativeBackend::Mtp
+      mtp_host(plan.speculative_backend == SpeculativeBackend::Mtp ||
+                       plan.speculative_backend == SpeculativeBackend::Eagle3
                    ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::MtpDecodeIngress) +
                                                           sizeof(qwen3_5::MtpDecodeEgress))
                    : std::nullopt),
@@ -194,6 +196,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (dflash.has_value() != plan.features.masked_draft()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
+    if (plan.persistent.eagle3) { eagle3_prefill.emplace(backing, *plan.persistent.eagle3); }
+    if (eagle3_prefill.has_value() !=
+        (speculative_backend == SpeculativeBackend::Eagle3)) {
+        throw std::logic_error("EAGLE3 prefill state does not match the sequence plan");
+    }
     if (qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
         backend_host_kv_page_stride =
             plan_host_kv_page_layout(backend->page_pool().geometry()).page_stride;
@@ -254,7 +261,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
     }
-    if (io.mtp_decode.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
+    if (io.mtp_decode.has_value() !=
+        (speculative_backend == SpeculativeBackend::Mtp ||
+         speculative_backend == SpeculativeBackend::Eagle3)) {
         throw std::logic_error("MTP decode frame does not match the sequence plan");
     }
     if (io.ordinary.has_value() !=
@@ -277,6 +286,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     if (plan.persistent.sampling_config) {
         sampling_config = plan.persistent.sampling_config->bind(backing);
+    }
+    if (plan.persistent.grammar_masks) {
+        grammar_masks_device = plan.persistent.grammar_masks->bind(backing);
+        grammar_masks_host.emplace(grammar_masks_device.bytes());
+    }
+    // A constrained block-backend round reads its drafts back from the device between phases.
+    if (is_masked_draft_backend(speculative_backend)) {
+        dflash_draft_handoff.emplace(device, static_cast<std::size_t>(draft_window) * max_concurrency);
     }
     if (plan.persistent.qwen4) {
         const Qwen4PersistentLayout& layout = *plan.persistent.qwen4;
@@ -342,7 +359,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     set_device_i32(io.text_kv_table_row, 0);
     if (!causal_scoring) { set_device_i32(io.backend_kv_table_row, 0); }
 
-    host_tokens = round_host ? static_cast<TokenId*>(round_host->data()) : nullptr;
+    host_tokens = round_host
+                      ? &static_cast<qwen3_5::PrefillRoundHost*>(round_host->data())->sampled_token
+                      : nullptr;
     if (ordinary_host) {
         ordinary_host_ingress = static_cast<qwen3_5::OrdinaryDecodeIngress*>(ordinary_host->data());
         ordinary_host_egress  = reinterpret_cast<qwen3_5::OrdinaryDecodeEgress*>(
@@ -520,6 +539,9 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 decoder->text_kv,
                 nullptr,
                 nullptr,
+                nullptr,
+                {},
+                nullptr,
                 cursor,
                 nullptr,
                 nullptr,
@@ -531,7 +553,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             mark_workspace_usage(workspace_plan.text_prefill);
             const execution::PrefillChunkResult result = execution::prefill_text_chunk(
                 schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
-                false);
+                false, 0);
             if (result.finalized || result.processed_tokens == 0 ||
                 result.processed_tokens > nominal) {
                 throw std::logic_error("causal score Prefill made invalid progress");

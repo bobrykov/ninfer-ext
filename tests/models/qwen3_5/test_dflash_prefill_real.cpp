@@ -172,6 +172,9 @@ void run(const char* artifact, SpeculativeBackend backend) {
         program.decoder->text_kv,
         nullptr,
         &*program.dflash,
+        nullptr,
+        {},
+        nullptr,
         0,
         nullptr,
         nullptr,
@@ -192,7 +195,8 @@ void run(const char* artifact, SpeculativeBackend backend) {
                                    cudaMemcpyHostToDevice, device.stream));
     };
     const auto prefill = [&](std::uint32_t nominal, std::optional<std::uint32_t> split = {}) {
-        const auto result   = execution::prefill_text_chunk(context, tokens, nominal, split, false);
+        const auto result =
+            execution::prefill_text_chunk(context, tokens, nominal, split, false, 0);
         const auto expected = split ? std::min(nominal, *split - context.text_kv_base) : nominal;
         require(result.processed_tokens == expected && !result.finalized,
                 "prefill did not honor its actual chunk boundary");

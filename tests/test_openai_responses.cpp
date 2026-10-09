@@ -604,9 +604,10 @@ int test_tools_and_effective_subset() {
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(body, limits());
     int failures = 0;
-    failures += check(request.tools.size() == 2 && request.prompt.generation.tools.size() == 1 &&
-                          request.prompt.generation.tools[0].name == "clock",
-                      "wire tool list and effective callable subset remain distinct");
+    failures += check(request.tools.size() == 2 && request.prompt.generation.tools.size() == 2 &&
+                          request.prompt.generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"clock"},
+                      "wire tool list and selected callable subset remain distinct");
 
     Json none           = body;
     none["tool_choice"] = "none";
@@ -662,11 +663,15 @@ int test_namespace_tools() {
     failures += check(request.tools.size() == 2 && request.tools[0].at("type") == "namespace" &&
                           request.tools[0].at("tools")[0].at("name") == "now",
                       "wire namespace grouping is retained in the response echo");
-    failures += check(request.prompt.generation.tools.size() == 1 &&
-                          request.prompt.generation.tools[0].name == "mcp__clock__now" &&
-                          request.prompt.generation.tools[0].description ==
-                              "Clock service\n\nRead the current time",
-                      "allowed namespace function lowers to one Engine tool with shared context");
+    const auto described = std::any_of(
+        request.prompt.generation.tools.begin(), request.prompt.generation.tools.end(),
+        [](const auto& tool) {
+            return tool.description == "Clock service\n\nRead the current time";
+        });
+    failures += check(request.prompt.generation.tools.size() == 2 &&
+                          request.prompt.generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"mcp__clock__now"} && described,
+                      "namespace selection keeps every declaration with shared context");
     failures +=
         check(request.tool_identities.at("mcp__clock__now").name == "now" &&
                   request.tool_identities.at("mcp__clock__now").wire_namespace == "mcp__clock",
@@ -796,17 +801,34 @@ int test_explicit_rejections() {
 
     Json value     = base;
     value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"strict", true}}});
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(value, limits());
-                      }) == "strict_tools_not_supported",
-                      "strict function schema is rejected explicitly");
+    failures += check(parse_openai_responses_create_request(value, limits())
+                              .prompt.generation.tools[0]
+                              .strict,
+                      "strict function schema reaches generation");
 
     value         = base;
-    value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(value, limits());
-                      }) == "structured_outputs_not_supported",
-                      "structured output is rejected explicitly");
+    value["text"] = Json{{"format", Json{{"type", "json_object"}}}};
+    failures += check(parse_openai_responses_create_request(value, limits())
+                                  .prompt.generation.constraint->kind ==
+                              ninfer::OutputConstraintKind::JsonObject,
+                      "text.format json_object reaches the constraint");
+    for (const auto& value_choice : {Json{{"choice", {"yes", "no"}}}, Json{{"regex", "[a-z]+"}}}) {
+        value["text"]                  = Json{{"format", Json{{"type", "text"}}}};
+        value["structured_outputs"]    = value_choice;
+        const auto parsed_choice       = parse_openai_responses_create_request(value, limits());
+        failures += check(parsed_choice.prompt.generation.constraint ==
+                              (value_choice.contains("choice")
+                                   ? ninfer::OutputConstraint::choice({"yes", "no"})
+                                   : ninfer::OutputConstraint::regex("[a-z]+")),
+                          "Responses choice/regex reaches the constraint");
+    }
+    value.erase("structured_outputs");
+    value["text"] = Json{{"format", Json{{"type", "json_schema"},
+                                        {"name", "trip"},
+                                        {"schema", Json{{"type", "object"}}}}}};
+    failures += check(parse_openai_responses_create_request(value, limits())
+                              .prompt.generation.constraint_param == "text.format.schema",
+                      "Responses JSON schema names its own field");
 
     value               = base;
     value["background"] = true;
@@ -1189,6 +1211,28 @@ int test_input_tokens_uses_shared_state_path() {
     return failures;
 }
 
+int test_responses_leading_instruction_shared_prefix() {
+    int failures = 0;
+    const Json body =
+        Json{{"model", "qwen"}, {"instructions", "you are an agent"}, {"input", "go"}};
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    // The policy needs the resolved instruction turn, so parsing only stores it.
+    failures += check(request.prompt.cache_policy.has_value(),
+                      "Responses parsing dropped the prompt cache policy");
+    OpenAIResponsesStore store(8, 1ULL << 20);
+    const OpenAIResponsesResolvedPrompt resolved =
+        resolve_openai_responses_prompt(request.prompt, store, "resp_frontier", true);
+    failures += check(!resolved.generation.messages.empty() &&
+                          resolved.generation.messages.front().role ==
+                              ninfer::ChatRole::Developer &&
+                          resolved.generation.messages.front().cache_boundary_after.has_value() &&
+                          resolved.generation.messages.front().cache_boundary_after->evidence ==
+                              ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                      "Responses resolution did not publish the frontier shared-prefix candidate");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1207,6 +1251,7 @@ int main() {
     failures += test_response_object();
     failures += test_sse_sequence_and_failures();
     failures += test_input_tokens_uses_shared_state_path();
+    failures += test_responses_leading_instruction_shared_prefix();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

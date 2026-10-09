@@ -16,7 +16,10 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
 | Sample disjoint EXL3 traces through `ninfer-serve` | [`exl3/sample_traces.py`](exl3/sample_traces.py) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
+| Optimize a model's configuration for a use case | [`optimizer/`](optimizer/); [guide](../docs/optimizer.md) |
 | Swap an artifact's trailing chat-template resource without reconverting | [`artifact/replace_resource.py`](artifact/replace_resource.py); [usage](#artifact-workflow) |
+| Enable a route on an already-downloaded artifact (`activation_policy` metadata only) | [`artifact/set_activation_policy.py`](artifact/set_activation_policy.py); [usage](#artifact-workflow) |
+| Attach a donor's DFlash2 component to a v3 artifact without requantizing | [`artifact/attach_dflash2.py`](artifact/attach_dflash2.py); [guide](../docs/weight-conversion.md#attach-an-existing-dflash2-component) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
@@ -81,6 +84,17 @@ result is written to a new path with a new `artifact_id`:
 ```bash
 python3 -m tools.artifact.replace_resource in.ninfer out.ninfer \
   --resource frontend/chat_template.jinja=tools/chat_templates/qwen.jinja
+```
+
+Enable a route that the stored weights already support without reconverting. A Use's
+`activation_policy` is the permission for the activation precision at that parameter's mathematical
+inputs, so rewriting it is metadata-only: every weight byte is kept, the payload start does not
+move, and the result is written to a new path with a new `artifact_id`. For example, the Q4 W4A8
+prefill route is enabled on the groupwise-int MLP gate/up uses:
+
+```bash
+python3 -m tools.artifact.set_activation_policy in.ninfer out.ninfer \
+  --parameter '*/mlp/gate' --parameter '*/mlp/up' --policy AllowA8
 ```
 
 Recipes, mixed sources, custom methods, resources and sharding are described in the

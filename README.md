@@ -7,6 +7,16 @@ The fork adds four things on top of upstream's engine:
 
 - **Qwen3.8-Flash-Next on one 32 GB GPU.** A ~180B-parameter MoE model whose routed experts live in
   pinned Host memory behind a device expert cache. Stock NInfer cannot load it.
+- **Constrained decoding** on the generated content: JSON object and JSON Schema through the
+  standard `response_format`/`text.format` fields on all three HTTP protocols, GBNF, choice and
+  regex through the `structured_outputs` object, and
+  `--json-object`/`--json-schema-file`/`--grammar-file`/`--regex`/`--choice` on the CLI. The vocabulary-wide legal set is compiled once per model and applied per round on the device,
+  per verify position, so speculative drafting keeps working; the supported schema subset and the
+  current limits are in [constrained decoding](docs/maintainer/constrained-decoding.md).
+- **Constrained tool calls**: `tool_choice` `required`/named/`allowed_tools`, `parallel_tool_calls:
+  false`, and per-function `strict` schemas, so a published call is complete and its arguments
+  satisfy the declared schema. Declarations always reach the prompt; the selection constrains the
+  generated calls. See [constrained decoding](docs/maintainer/constrained-decoding.md).
 - **Faster speculative decoding on Qwen3.8-27B `groupwise-int`.** Against stock on the same
   artifacts, DFlash2 serving is 13–48% faster at 1–4 concurrent requests, and MTP 8–32% faster.
 - **Serving work for long-running agents.** Context-cache salvage and anchoring, one Host-tier
@@ -89,6 +99,18 @@ Face; they download and run unchanged ([EXL3 quantization](#exl3-quantization),
 yourself ([instructions](#converting-a-dflash2-artifact)). Converted artifacts embed this fork's chat template
 ([conversion guide](docs/weight-conversion.md)). An existing v2 download can be
 [upgraded locally](docs/weight-conversion.md#upgrade-an-existing-v2-artifact).
+
+Qwen3.8-27B `groupwise-int` has a Q4 W4A8 prefill route. The upstream artifact stores `A16Only` on
+the MLP gate/up uses, so enable it on an existing download without reconverting (a fresh conversion
+already declares `AllowA8`):
+
+```bash
+python3 -m tools.artifact.set_activation_policy models/qwen3_8_27b.ninfer models/qwen3_8_27b_a8.ninfer \
+  --parameter '*/mlp/gate' --parameter '*/mlp/up' --policy AllowA8
+```
+
+The route measures ~1.6-1.7x the A16 gate/up op and ~1.16x on a 1410-token prefill
+([design note](docs/maintainer/w4a8-prefill.md)).
 
 ### 4. Serve and send a request
 
@@ -358,6 +380,35 @@ python3 -m tools.convert --model /path/to/Qwen3.8-27B --recipe qwen3_8_27b \
   --proposal --name qwen3.8-27b --out models/qwen3_8_27b_dflash2.ninfer
 ```
 
+### Converting an EAGLE3 artifact
+
+No published artifact carries EAGLE3 either. Convert one from a Qwen3.6-35B-A3B checkpoint and a
+SpecForge `LlamaForCausalLMEagle3` head:
+
+```bash
+python3 -m tools.convert --model /path/to/Qwen3.6-35B-A3B-NVFP4 \
+  --recipe qwen3_6_35b_a3b_nvfp4 \
+  --source quantized=/path/to/Qwen3.6-35B-A3B-NVFP4 \
+  --source eagle3=/path/to/Qwen3.6-35B-A3B-Eagle3-Specforge \
+  --components text,vision,mtp,eagle3 \
+  --resource chat_template.jinja=tools/chat_templates/qwen.jinja \
+  --proposal --name qwen3.6-35b-a3b-eagle3 \
+  --out models/qwen3_6_35b_a3b_nvfp4_eagle3.ninfer
+```
+
+The head used here is the SpecForge EAGLE3 draft for Qwen3.5-35B-A3B
+(`jiapingW/Qwen3.5-35B-A3B-Eagle3-Specforge`). The converter normalizes its `midlayer.*` weights,
+derives the three target layers it fuses, stores the draft-to-target token map, and inherits the
+target's token embedding and tokenizer. Heads in the `speculators`/vLLM layout (nested
+`transformer_layer_config`, `layers.0.*` weights, a declared `eagle_aux_hidden_state_layer_ids` and a
+partial rotary factor) convert the same way; note that a published head is not automatically better
+for your traffic — the EAGLE3 reference measures the choices it knows. Serve it with `--spec eagle3 --draft-tokens N`. Keep
+`--proposal`: EAGLE3 does not need the optimized proposal head (it drafts through its own 32k head
+and rejects `--lm-head-draft`), but without it the file cannot run the documented
+`--spec mtp --lm-head-draft` configuration at all, so EAGLE3 could only be compared against — or
+fall back to — the slower full-head MTP. See [EAGLE3](docs/maintainer/eagle3.md) for the draft
+graph, the target conditioning, the draft-KV cost and the measured comparison against MTP.
+
 ## Qwen3.8-Flash-Next
 
 Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`) has about 180B parameters: about 121B are 512 routed
@@ -461,6 +512,11 @@ same device expert cache. Measured on the development machine (RTX 5090, i9-285K
   investigated.
 - Next-layer expert prefetch (the next router applied to this layer's input, fetching its predicted
   misses early) cost 4–8% decode here and is not in the tree.
+- Frequency-protected cache admission (LFRU, scoring slots `freq / (age + 1)` instead of by age)
+  cost 3.9–4.0% **more** misses than the LRU key and is not in the tree: 32,862 and 32,907 misses
+  under LRU against 34,132 (per-expert counts) and 34,173 (sticky frame counts), on one
+  23,430-token prompt and 512 greedy tokens with `qwen3_8_flash_next_nvfp4.ninfer` and 8,237
+  resident slots. Every run produced byte-identical text.
 
 ```bash
 hf download jabbatheduck/ninfer-ext-models --include "qwen3.8-flash-next-exl3-3p5bpw/*" --local-dir models
@@ -836,8 +892,9 @@ describes the planner.
 - Text with thinking and non-thinking modes.
 - Image, multi-image, video and mixed multimodal input (`--vision`).
 - Chunked prefill, and CUDA Graph decode of one to eight concurrent requests.
-- Speculative decoding: MTP on every model, DFlash (draft windows 1–15) on Qwen3.6-35B-A3B, and
-  DFlash2 on Qwen3.8-27B artifacts that carry the companion weights. A host prompt-lookup (suffix)
+- Speculative decoding: MTP on every model, DFlash (draft windows 1–15) on Qwen3.6-35B-A3B,
+  DFlash2 on Qwen3.8-27B artifacts that carry the companion weights, and EAGLE3 (draft windows
+  1–15) on artifacts that carry an EAGLE3 draft head. A host prompt-lookup (suffix)
   draft source rides any MTP model, with a measured cost gate (`--lookup-drafts`).
 - BF16, INT8, FP8, NVFP4 and K8V4 KV storage.
 - Private and shared exact-prefix reuse, with Device and Host retention.

@@ -8,6 +8,7 @@ from tools.convert.methods import fp8_row_maxabs, import_encoded, nvfp4_absmax
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
     RECIPES,
+    qwen3_6_27b,
     qwen3_8_27b,
     qwen3_8_27b_bf16,
     qwen3_8_27b_exl3,
@@ -205,6 +206,22 @@ def test_registered_recipe_gives_the_mlp_pair_q4() -> None:
     assert _single(formats, "text/output_head") == Q8
 
 
+def test_groupwise_recipes_allow_a8_on_the_mlp_pair_only() -> None:
+    """The Q4 gate/up pair has a W4A8 prefill route; every other use stays A16Only."""
+    for recipe_function in (qwen3_6_27b, qwen3_8_27b):
+        model = _dense_model()
+        recipe = Recipe(model)
+        recipe_function(model, recipe, {})
+        assert recipe.policies[(f"{LAYER}/mlp/gate", "input")] == "AllowA8"
+        assert recipe.policies[(f"{LAYER}/mlp/up", "input")] == "AllowA8"
+        for name in (
+            f"{LAYER}/mlp/down",
+            f"{LAYER}/attention/query",
+            f"{LAYER}/attention/output",
+        ):
+            assert recipe.policies[(name, "input")] == "A16Only"
+
+
 def test_q6_recipe_moves_only_the_mlp_pair() -> None:
     registered = _formats(qwen3_8_27b)
     q6 = _formats(qwen3_8_27b_q6)
@@ -233,3 +250,39 @@ def test_q6_recipe_leaves_the_other_projections_alone() -> None:
     assert _single(formats, f"{LAYER}/attention/output") == Q5
     assert _single(formats, f"{LAYER}/gdn/output") == Q5
     assert _single(formats, f"{LAYER}/mlp/down") == Q5
+
+
+def test_35b_nvfp4_recipe_reads_a_modelopt_expert_prefix(tmp_path) -> None:
+    """`_moe_encoded_source` must import either the compressed-tensors or the ModelOpt layout."""
+    from types import SimpleNamespace
+
+    from safetensors.torch import save_file
+
+    from tools.convert.official_recipes import _moe_encoded_source
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    prefix = "model.language_model.layers.3.mlp.experts.7.gate_proj"
+    save_file(
+        {
+            prefix + ".weight": torch.tensor(
+                [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]], dtype=torch.uint8
+            ),
+            prefix + ".weight_scale": torch.tensor([[0x38]], dtype=torch.uint8).view(
+                torch.float8_e4m3fn
+            ),
+            prefix + ".weight_scale_2": torch.tensor(2.0, dtype=torch.float32),
+            prefix + ".input_scale": torch.tensor(1.5, dtype=torch.float32),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    with SafetensorsSource(tmp_path) as store:
+        source = _moe_encoded_source(
+            store, SimpleNamespace(shape=(1, 16)), "text/layers/3/moe/experts/7/gate"
+        )
+        assert torch.equal(
+            source.values().reshape(1, 16),
+            torch.tensor(
+                [[0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
+                  0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0]]
+            ),
+        )

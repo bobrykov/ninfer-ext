@@ -396,9 +396,14 @@ bool Program::has_unsettled_state_fork() const { return impl_->has_unsettled_sta
 bool Program::has_idle_lane_debris() const { return impl_->has_idle_lane_debris(); }
 void Program::clear_idle_lanes() noexcept { impl_->clear_idle_lanes(); }
 
+bool Program::consumes_token_masks() const noexcept {
+    return impl_->consumes_token_masks();
+}
+
 PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::PrefillPace pace,
-                                         runtime::ExecutionTiming* failed_timing) {
-    return impl_->advance_prefill(sequence, pace, failed_timing);
+                                         runtime::ExecutionTiming* failed_timing,
+                                         runtime::TokenMaskProvider* masks) {
+    return impl_->advance_prefill(sequence, pace, failed_timing, masks);
 }
 
 CaptureAssessment
@@ -474,8 +479,9 @@ runtime::ContextTransactionReserveStatus Program::reserve_active_capture_with_pr
 
 PendingBatch Program::decode(std::span<const SequenceHandle> sequences,
                              std::span<const runtime::RoundBudget> budgets,
-                             runtime::ExecutionTiming* failed_timing) {
-    return impl_->decode(sequences, budgets, failed_timing);
+                             runtime::ExecutionTiming* failed_timing,
+                             runtime::TokenMaskProvider* masks) {
+    return impl_->decode(sequences, budgets, failed_timing, masks);
 }
 
 runtime::ExecutionTiming

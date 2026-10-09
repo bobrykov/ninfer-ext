@@ -1,5 +1,8 @@
 #include "options.h"
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -31,7 +34,41 @@ int check(bool condition, const char* message) {
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures      = 0;
+    const auto choice = parse({"ninfer", "model.ninfer", "--prompt", "hello", "--choice", "",
+                               "--choice", "a|b", "--choice", "你好"});
+    failures += check(choice.choices == std::vector<std::string>{"", "a|b", "你好"},
+                      "choice flags changed literal text or order");
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex", ""}).regex == "",
+              "empty regex must be distinct from no regex");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex", "",
+                                       "--choice", "yes"});
+                      }),
+                      "regex and choice were accepted together");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello", "--regex",
+                                       "a", "--json-object"});
+                      }),
+                      "regex and JSON were accepted together");
+    failures += check(
+        parse({"ninfer", "model.ninfer", "--prompt", "hello", "--grammar-file", "answer.gbnf"})
+                .grammar_path == "answer.gbnf",
+        "grammar file argument was lost");
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-object"}).json_object,
+              "JSON object CLI option lost");
+    failures +=
+        check(parse({"ninfer", "model.ninfer", "--prompt", "hello", "--json-schema-file",
+                     "answer.json"})
+                      .json_schema_path == "answer.json",
+              "schema file CLI option lost");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "model.ninfer", "--prompt", "hello",
+                                       "--json-object", "--grammar-file", "a.gbnf"});
+                      }),
+                      "conflicting CLI constraints accepted");
     const ninfer::cli::Options cached =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hi", "--expert-cache", "20480"});
     failures += check(cached.expert_cache.mode == ninfer::ExpertCacheMode::Explicit &&
@@ -129,6 +166,25 @@ int main() {
                                        "--fixed-draft"});
                       }),
                       "--fixed-draft was accepted without a speculative backend");
+    const ninfer::cli::Options eagle3_chain =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "eagle3",
+               "--draft-tokens", "3"});
+    failures += check(eagle3_chain.speculative.backend == ninfer::SpeculativeBackend::Eagle3 &&
+                          eagle3_chain.speculative.tree_width == 1,
+                      "EAGLE3 did not default to a draft chain");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "mtp", "--draft-tokens", "3", "--draft-tree", "2"});
+                      }),
+                      "CLI accepted --draft-tree with MTP");
+    for (const auto w : {0U, 2U, 9U}) {
+        failures += check(rejects([&] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                           "--spec", "eagle3", "--draft-tokens", "3", "--draft-tree",
+                                           std::to_string(w)});
+                          }),
+                          "CLI accepted an EAGLE3 draft-tree width other than 1");
+    }
     failures += check(rejects([] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
                                        "dflash", "--draft-tokens", "7", "--fixed-draft"});
@@ -204,5 +260,40 @@ int main() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    // --profile loads base options; the command line overrides; serve-only options are dropped.
+    const auto profile_path =
+        std::filesystem::temp_directory_path() /
+        ("ninfer-cli-profile-" +
+         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+    {
+        std::ofstream profile(profile_path);
+        profile << R"({"artifact_type":"ninfer_serve_profile","schema_version":1,)"
+                   R"("options":{"kv-dtype":"nvfp4","max-context":4096,"prefill-chunk":1024,)"
+                   R"("spec":"mtp","draft-tokens":5,"lm-head-draft":true,"vision":true,)"
+                   R"("max-concurrency":4}})";
+    }
+    const ninfer::cli::Options profiled =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hi", "--profile", profile_path.string()});
+    failures += check(profiled.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16 &&
+                          profiled.max_context == 4096 && profiled.prefill_chunk == 1024U &&
+                          profiled.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          profiled.speculative.draft_tokens == 5 &&
+                          profiled.speculative.proposal_head == ninfer::ProposalHead::Optimized &&
+                          profiled.enable_vision,
+                      "--profile did not apply the CLI-compatible options");
+    const ninfer::cli::Options overridden =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hi", "--profile", profile_path.string(),
+               "--max-context", "8192"});
+    failures += check(overridden.max_context == 8192 &&
+                          overridden.speculative.backend == ninfer::SpeculativeBackend::Mtp,
+                      "command-line flags did not override --profile");
+    const ninfer::cli::Options equals_form = parse({"ninfer-cli", "model.ninfer", "--prompt", "hi",
+                                                    "--profile=" + profile_path.string()});
+    failures += check(equals_form.max_context == 4096, "--profile=PATH did not load");
+    failures += check(ninfer::cli::usage_text("ninfer-cli").contains("--profile"),
+                      "CLI help omits --profile");
+    std::error_code profile_cleanup;
+    std::filesystem::remove(profile_path, profile_cleanup);
+    failures += check(!profile_cleanup, "CLI profile test file cleanup failed");
     return failures == 0 ? 0 : 1;
 }

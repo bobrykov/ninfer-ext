@@ -237,11 +237,12 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                          std::uint32_t text_kv_base, qwen3_5::PagedKVCacheView mtp_kv,
                          const qwen3_5::PagedKVCache* batch_text_kv,
-                         const qwen3_5::PagedKVCache* batch_mtp_kv)
+                         const qwen3_5::PagedKVCache* batch_mtp_kv,
+                         const qwen3_5::PagedKVCache* batch_eagle3_kv)
     : ctx_(ctx), parameters_(weights), config_(weights.model.config().text), work_(work), kv_(kv),
       mtp_kv_(mtp_kv), state_(state), io_(io), prefill_hidden_(prefill_hidden),
       prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv),
-      batch_mtp_kv_(batch_mtp_kv) {
+      batch_mtp_kv_(batch_mtp_kv), batch_eagle3_kv_(batch_eagle3_kv) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -1272,8 +1273,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             throw std::invalid_argument("multimodal prefill requires a Vision session");
         }
         rope_delta_ = multimodal->rope_delta;
-    } else if (text_kv_base_ == 0) {
-        rope_delta_ = 0;
+    } else {
+        // A reused media prefix can leave only text to prefill, but its RoPE offset still applies.
+        // A freshly constructed TextContext must take the offset from the sequence, not default 0.
+        rope_delta_ = text_prefill != nullptr ? text_prefill->rope_delta : 0;
     }
     ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
 
@@ -1290,6 +1293,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     const bool has_split = split_abs > base64 && split_abs <= base64 + static_cast<std::int64_t>(T);
     const int split_rel  = has_split ? static_cast<int>(split_abs - base64) : -1;
     const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
+    const bool prepare_eagle3_prompt = eagle3_enabled() && eagle3_prefill_features_ != nullptr;
     if (prepare_mtp_prompt &&
         mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
         throw std::logic_error("MTP proposal extent exceeds the configured draft window");
@@ -1404,7 +1408,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
-            if (prepare_mtp_prompt) {
+            if (prepare_mtp_prompt || prepare_eagle3_prompt) {
                 const std::uint32_t alignment_tokens =
                     multimodal != nullptr ? static_cast<std::uint32_t>(multimodal->token_ids.size())
                     : text_prefill != nullptr
@@ -1436,7 +1440,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
                 Tensor mtp_input_embeddings;
                 const Tensor* mtp_input_embeddings_ptr = nullptr;
-                if (multimodal != nullptr) {
+                if (prepare_mtp_prompt && multimodal != nullptr) {
                     mtp_input_embeddings =
                         work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
                     ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, s);
@@ -1453,7 +1457,27 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     }
                     mtp_input_embeddings_ptr = &mtp_input_embeddings;
                 }
-                if (is_last && mtp_proposal_extent_ != 0) {
+                if (prepare_eagle3_prompt) {
+                    const auto& eagle      = *parameters_.model.config().draft->eagle3;
+                    const std::int32_t dim = dimension(config_.hidden_size);
+                    const std::int32_t fused =
+                        static_cast<std::int32_t>(eagle.fused_input_size());
+                    // The capture wrote this chunk's three target layers into the persistent
+                    // buffer; the encoder fuses them and the one-layer draft decoder appends the
+                    // chunk's draft KV while consuming the shifted tokens.
+                    Tensor features = eagle3_prefill_features_->slice(1, 0, len);
+                    Tensor g        = work_.alloc(DType::BF16, {dim, len, 1});
+                    eagle3_encode_batch(features.view({fused, len, 1}), g);
+                    Tensor kv_rows = work_.alloc(DType::I32, {1});
+                    ops::set_i32_scalar(kv_rows, eagle3_kv_table_row_, s);
+                    Tensor valid = work_.alloc(DType::I32, {1});
+                    ops::set_i32_scalar(valid, len, s);
+                    Tensor draft_hidden = work_.alloc(DType::BF16, {dim, len, 1});
+                    Tensor draft_rope   = rope_positions.ne[1] == 1 ? rope_positions : positions;
+                    eagle3_forward_decode_batch(mtp_ids.view({len, 1}), g, positions.view({len, 1}),
+                                                draft_rope.view({len, 1}), valid, kv_rows,
+                                                chunk_envelope, draft_hidden);
+                } else if (is_last && mtp_proposal_extent_ != 0) {
                     Tensor logits = matrix_window(io_.logits, 1);
                     Tensor draft0 = io_.mtp->draft_tokens.slice(0, 0, 1);
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
@@ -1517,12 +1541,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 }
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
-                                              std::uint32_t nominal_length, bool finalize_at_end) {
+                                              std::uint32_t nominal_length, bool finalize_at_end,
+                                              std::int32_t rope_delta) {
     if (begin >= full_ids.size() || nominal_length == 0 ||
         nominal_length > full_ids.size() - begin) {
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
-    const TextPrefill text_prefill{full_ids, begin};
+    const TextPrefill text_prefill{full_ids, begin, rope_delta};
     NullTap tap;
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, tap,
                         finalize_at_end);
@@ -1530,12 +1555,12 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                               std::uint32_t nominal_length, bool finalize_at_end,
-                                              DFlashFeatureSink& sink) {
+                                              std::int32_t rope_delta, DFlashFeatureSink& sink) {
     if (begin >= full_ids.size() || nominal_length == 0 ||
         nominal_length > full_ids.size() - begin) {
         throw std::invalid_argument("text prefill chunk is outside the prompt");
     }
-    const TextPrefill text_prefill{full_ids, begin};
+    const TextPrefill text_prefill{full_ids, begin, rope_delta};
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
                         finalize_at_end);
 }

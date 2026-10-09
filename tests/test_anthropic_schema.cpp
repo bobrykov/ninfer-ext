@@ -134,9 +134,25 @@ int test_envelope_and_field_policy() {
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
                       "Engine top_k range was not enforced");
     body                  = base_request();
+    body["structured_outputs"] = Json{{"choice", {"yes", "no"}}};
+    failures += check(parse(body).generation.constraint ==
+                          ninfer::OutputConstraint::choice({"yes", "no"}),
+                      "Anthropic choice reaches the constraint");
+    body.erase("structured_outputs");
+    body["structured_outputs"] = Json{{"regex", "[a-z]+"}};
+    failures += check(parse(body).generation.constraint ==
+                          ninfer::OutputConstraint::regex("[a-z]+"),
+                      "Anthropic regex reaches the constraint");
+    body.erase("structured_outputs");
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] { (void)parse(body); }) == "output_config_format_not_supported",
-                      "structured output was silently downgraded");
+    failures += check(api_param([&] { (void)parse(body); }) == "output_config.format.schema",
+                      "a schema format without a schema is refused at its field");
+    body["output_config"] =
+        Json{{"format", Json{{"type", "json_schema"}, {"schema", Json{{"type", "object"}}}}}};
+    const auto schema_constraint = parse(body).generation.constraint;
+    failures += check(schema_constraint->kind == ninfer::OutputConstraintKind::JsonSchema &&
+                          parse(body).generation.constraint_param == "output_config.format.schema",
+                      "Anthropic JSON schema reaches the constraint");
     body              = base_request();
     body["container"] = "container_1";
     failures += check(api_code([&] { (void)parse(body); }) == "container_not_supported",
@@ -384,26 +400,34 @@ int test_tools() {
                          "Anthropic tool schema/examples did not reach the Qwen prompt");
 
     body["tools"] = Json::array({ordinary_tool(true)});
-    failures += check(api_code([&] { (void)parse(body); }) == "strict_tools_not_supported",
-                      "active strict tool was accepted without constrained decoding");
+    const GenerationRequest strict = parse(body).generation;
+    failures += check(strict.tools[0].strict && strict.constrains_tools() &&
+                          !to_request_options(strict, {}, semantics(strict), true)
+                               .output.preserve_special_tokens,
+                      "strict tool selects constrained output and reaches generation");
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
     body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
     const GenerationRequest disabled    = parse(body).generation;
-    failures += check(!disabled.uses_tools() && prompt(disabled).options.tool_jsons.empty(),
-                      "tool_choice:none did not neutralize inactive tool guarantees");
+    // The prompt carries exactly the declarations the request kept, so a narrowed choice cannot
+    // change the prompt behind the caller's back.
+    failures += check(!disabled.uses_tools() &&
+                          prompt(disabled).options.tool_jsons.size() == disabled.tools.size(),
+                      "tool_choice:none keeps prompt declarations");
 
     body                = base_request();
     body["tools"]       = Json::array({ordinary_tool()});
     body["tool_choice"] = Json{{"type", "any"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "forced any-tool choice was silently downgraded");
+    failures += check(parse(body).generation.tool_choice.mode == ToolChoiceMode::Required,
+                      "any requires at least one invocation");
     body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "named tool choice was silently downgraded");
+    failures += check(parse(body).generation.tool_choice.mode == ToolChoiceMode::Required &&
+                          parse(body).generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"weather"},
+                      "named choice requires the selected function");
     body["tool_choice"] = Json{{"type", "auto"}, {"disable_parallel_tool_use", true}};
-    failures += check(api_code([&] { (void)parse(body); }) == "parallel_tool_use_not_supported",
-                      "active single-tool-call guarantee was silently downgraded");
+    failures += check(!parse(body).generation.tool_choice.parallel,
+                      "disable_parallel_tool_use reaches generation");
 
     body          = base_request();
     body["tools"] = Json::array({Json{{"type", "web_search_20250305"}, {"name", "web_search"}}});

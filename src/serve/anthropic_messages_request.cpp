@@ -700,7 +700,7 @@ struct ParsedTool {
     ToolDefinition definition;
     ToolSource source = ToolSource::UserDefined;
     std::string source_type;
-    bool strict        = false;
+
     bool defer_loading = false;
     std::optional<std::vector<std::string>> allowed_callers;
 };
@@ -710,9 +710,11 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
     if (!body.contains("tools") || body.at("tools").is_null()) { return result; }
     if (!body.at("tools").is_array()) { bad_request("tools must be an array", "tools"); }
     std::unordered_set<std::string> names;
+    std::size_t source_index = 0;
     for (const Json& item : body.at("tools")) {
         if (!item.is_object()) { bad_request("tools entries must be objects", "tools"); }
         ParsedTool parsed;
+        parsed.definition.schema_param = "tools/" + std::to_string(source_index++) + "/input_schema";
         if (item.contains("type") && !item.at("type").is_null()) {
             if (!item.at("type").is_string()) {
                 bad_request("tool type must be a string or null", "tools");
@@ -759,7 +761,7 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("tool strict must be a boolean", "tools");
             }
-            parsed.strict = item.at("strict").get<bool>();
+            parsed.definition.strict = item.at("strict").get<bool>();
         }
         if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
             if (!item.at("defer_loading").is_boolean()) {
@@ -799,19 +801,17 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         if (std::ranges::none_of(definitions, named)) {
             bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
         }
-        bad_request("tool_choice.type='tool' requires that exact tool to be called, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+        request.tool_choice.allowed_names = std::vector<std::string>{selection.name};
     }
     if (selection.kind == ToolSelectionKind::Any) {
         if (definitions.empty()) { bad_request("tool_choice requires tools", "tool_choice"); }
-        bad_request("tool_choice.type='any' requires at least one tool call, which NInfer cannot "
-                    "guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+        request.tool_choice.mode = ToolChoiceMode::Required;
     }
 
-    request.tool_choice.mode =
-        selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None : ToolChoiceMode::Auto;
+    request.tool_choice.mode = selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None
+                                   : selection.kind == ToolSelectionKind::Auto
+                                       ? ToolChoiceMode::Auto
+                                       : ToolChoiceMode::Required;
     if (selection.kind == ToolSelectionKind::None) {
         for (ParsedTool& tool : definitions) {
             if (tool.source == ToolSource::UserDefined) {
@@ -832,11 +832,6 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "NInfer does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        if (tool.strict) {
-            bad_request("strict=true requires generated tool input to satisfy the declared JSON "
-                        "Schema, which NInfer cannot guarantee",
-                        "tools", "strict_tools_not_supported");
-        }
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
                         "provide",
@@ -851,11 +846,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         }
         request.tools.push_back(std::move(tool.definition));
     }
-    if (selection.disable_parallel && !request.tools.empty()) {
-        bad_request("disable_parallel_tool_use=true requires at most one tool call, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "parallel_tool_use_not_supported");
-    }
+    request.tool_choice.parallel = !selection.disable_parallel;
 }
 
 void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose,
@@ -911,9 +902,8 @@ void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose pur
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
     if (purpose == ParsePurpose::Messages && config.contains("format") &&
         !config.at("format").is_null()) {
-        bad_request("output_config.format requires constrained decoding, which NInfer does not "
-                    "provide",
-                    "output_config.format", "output_config_format_not_supported");
+        parse_json_output_format(config.at("format"), request, "output_config.format",
+                                 JsonFormatProtocol::Anthropic);
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
     if (!config.at("effort").is_string()) {
@@ -1081,6 +1071,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
                         result.generation.max_tokens);
     result.hide_thinking = thinking_display_omitted(body);
     parse_generation_fields(body, result.generation);
+    parse_structured_outputs(body, result.generation);
     return result;
 }
 

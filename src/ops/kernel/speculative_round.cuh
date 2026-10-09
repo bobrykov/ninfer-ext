@@ -245,7 +245,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         logits + static_cast<std::int64_t>(row) * cols * physical_rows;
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
-    if (!(cfg.temperature > 0.0f) && !penalties) {
+    if (!(cfg.temperature > 0.0f) && !penalties && cfg.mask.words == nullptr) {
         if (tid == 0) {
             int a = 0;
             while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
@@ -307,6 +307,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                 __syncthreads();
             }
             if (tid == 0) {
+                if (cfg.mask.words && !isfinite(red_val[0])) { asm volatile("trap;"); }
                 const int selected = red_idx[0];
                 if (i < extent && selected == row_drafts[i]) {
                     a_sh = i + 1;
@@ -395,7 +396,10 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     const SamplingConfig cfg = configs[row];
     const bool greedy        = !(cfg.temperature > 0.0f);
     const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-    if ((greedy && !penalties) || token_domain <= kSamplerTileItems) { return; }
+    if ((greedy && !penalties && cfg.mask.words == nullptr) ||
+        token_domain <= kSamplerTileItems) {
+        return;
+    }
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
     if (partial == 0 && threadIdx.x == 0) {
         workspace.group_done[col] = 0;
@@ -415,8 +419,11 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
         for (int item = 0; item < kSamplerItemsPerThread; ++item) {
             const int tile_index = item * blockDim.x + threadIdx.x;
             const int v          = tile_start + tile_index;
-            keys[item] =
-                v < token_domain ? sampling_bf16_tile_sort_key(logits[base + v], tile_index) : 0u;
+            keys[item]           = (v < token_domain &&
+                          (!cfg.mask.words ||
+                           (cfg.mask.words[col * cfg.mask.stride + v / 32] & (1u << (v % 32)))))
+                                       ? sampling_bf16_tile_sort_key(logits[base + v], tile_index)
+                                       : 0u;
         }
         sampling_store_bf16_tile_topk(keys, cap, tile_start, workspace, col, partial,
                                       topk_storage.bf16);
@@ -478,7 +485,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     const bool greedy    = !(cfg.temperature > 0.0f);
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
-    if (greedy && !penalties) {
+    if (greedy && !penalties && cfg.mask.words == nullptr) {
         if constexpr (SparseProposal) {
             if (tid < 32 && col == 0 && group == 0)
                 speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors,
@@ -706,6 +713,37 @@ __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,
     if (i >= proposal_count) { return; }
     const int idx = proposal_tokens[i];
     if (idx >= 0 && idx < n) { proposal_tokens[i] = id_map[idx]; }
+}
+
+// Sets one row per column to negative infinity so a repeated argmax over the same logits yields
+// the next-best rows in order. logits is contiguous BF16 [rows, batch]; selected[b] names the
+// row masked in column b. Out-of-range selections are ignored.
+__global__ void mask_selected_logits_kernel(__nv_bfloat16* logits, const std::int32_t* selected,
+                                            std::int32_t rows, std::int32_t batch) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) { return; }
+    const int row = selected[b];
+    if (row < 0 || row >= rows) { return; }
+    __nv_bfloat16 neg_inf = __ushort_as_bfloat16(0xFC00U);
+    logits[static_cast<std::int64_t>(b) * rows + row] = neg_inf;
+}
+
+// Picks each sequence's winning draft chain: winners[s] is the lowest t in [0,T) maximizing
+// accepted[s*T+t]. accepted is contiguous I32 [batch*T]; winners is I32 [batch].
+__global__ void select_tree_winners_kernel(const std::int32_t* accepted, std::int32_t* winners,
+                                           std::int32_t tree_width, std::int32_t batch) {
+    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= batch) { return; }
+    std::int32_t best_t       = 0;
+    std::int32_t best_accept  = accepted[static_cast<std::int64_t>(s) * tree_width];
+    for (std::int32_t t = 1; t < tree_width; ++t) {
+        const std::int32_t value = accepted[static_cast<std::int64_t>(s) * tree_width + t];
+        if (value > best_accept) {
+            best_accept = value;
+            best_t      = t;
+        }
+    }
+    winners[s] = best_t;
 }
 
 } // namespace ninfer::ops

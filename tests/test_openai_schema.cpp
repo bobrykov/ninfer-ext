@@ -146,7 +146,6 @@ int test_standard_field_policy() {
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
     rejected("logprobs", true, "logprobs_not_supported");
     rejected("top_logprobs", 2, "logprobs_not_supported");
-    rejected("response_format", Json{{"type", "json_schema"}}, "response_format_not_supported");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
     rejected("moderation", Json::object(), "moderation_not_supported");
@@ -187,33 +186,140 @@ int test_standard_field_policy() {
 }
 
 int test_constrained_decoding_extensions() {
-    int failures                                           = 0;
-    const std::vector<std::pair<const char*, Json>> active = {
+    int failures = 0;
+
+    // Choice and regex are the other two non-JSON languages: literal alternatives and a pattern.
+    Json language                  = base_request();
+    language["structured_outputs"] = Json{{"choice", {"", "yes", "你好"}}};
+    failures += check(options(parse(language).generation).constraint ==
+                          ninfer::OutputConstraint::choice({"", "yes", "你好"}),
+                      "choice literals were changed in Engine translation");
+    language["structured_outputs"] = Json{{"regex", ""}};
+    failures +=
+        check(options(parse(language).generation).constraint == ninfer::OutputConstraint::regex(""),
+              "empty regex was dropped in Engine translation");
+    for (const auto& value : {Json{{"choice", Json::array()}}, Json{{"choice", {"a", 1}}},
+                              Json{{"regex", 7}}, Json{{"regex", "a"}, {"choice", {"a"}}}}) {
+        language["structured_outputs"] = value;
+        failures += check(api_error([&] { (void)parse(language); }).status == 400,
+                          "invalid choice/regex request accepted");
+    }
+    for (const auto kind :
+         {ninfer::RequestErrorKind::InvalidChoice, ninfer::RequestErrorKind::InvalidRegex}) {
+        const auto param = kind == ninfer::RequestErrorKind::InvalidChoice
+                               ? "structured_outputs.choice"
+                               : "structured_outputs.regex";
+        const auto error = request_error_to_api_error(ninfer::RequestError(kind, "invalid"), param);
+        failures += check(error.status == 400 && error.param == param &&
+                              error.code == (kind == ninfer::RequestErrorKind::InvalidChoice
+                                                 ? "invalid_choice"
+                                                 : "invalid_regex"),
+                          "choice/regex error was misclassified");
+    }
+
+    // GBNF is the other non-JSON entry point: one nonempty grammar string.
+    Json gbnf                     = base_request();
+    gbnf["structured_outputs"]    = Json{{"grammar", "root ::= \"yes\" | \"no\""}};
+    const OpenAIChatRequest wired = parse(gbnf);
+    failures += check(wired.generation.constraint->kind == ninfer::OutputConstraintKind::Grammar &&
+                          wired.generation.constraint->source == "root ::= \"yes\" | \"no\"" &&
+                          options(wired.generation).constraint == wired.generation.constraint,
+                      "structured_outputs.grammar reaches the generation request");
+
+    // The standard JSON output formats are the supported entry point for structured content.
+    Json object_mode              = base_request();
+    object_mode["response_format"] = Json{{"type", "json_object"}};
+    failures += check(options(parse(object_mode).generation).constraint->kind ==
+                          ninfer::OutputConstraintKind::JsonObject,
+                      "response_format json_object reaches the constraint");
+
+    Json schema = Json::object();
+    schema["type"]       = "object";
+    schema["properties"] = Json{{"city", Json{{"type", "string"}}}};
+    schema["required"]   = Json::array({"city"});
+
+    Json json_schema = Json::object();
+    json_schema["name"]   = "trip";
+    json_schema["strict"] = true;
+    json_schema["schema"] = schema;
+
+    Json schema_mode                = base_request();
+    schema_mode["response_format"]  = Json::object();
+    schema_mode["response_format"]["type"]        = "json_schema";
+    schema_mode["response_format"]["json_schema"] = json_schema;
+
+    const auto schema_constraint = options(parse(schema_mode).generation).constraint;
+    failures += check(schema_constraint->kind == ninfer::OutputConstraintKind::JsonSchema &&
+                          schema_constraint->source.contains("\"city\""),
+                      "response_format json_schema carries its schema");
+    schema_mode["response_format"] = Json{{"type", "text"}, {"extra", 1}};
+    failures += check(api_error([&] { (void)parse(schema_mode); }).param == "response_format",
+                      "text format with options is refused");
+    schema_mode["response_format"] = Json{{"type", "json_schema"},
+                                          {"json_schema", Json{{"schema", Json::object()}}}};
+    failures += check(api_error([&] { (void)parse(schema_mode); }).param ==
+                          "response_format.json_schema.name",
+                      "json_schema without a name is refused at its field");
+
+    // Every other alias promises constrained generation, so it is refused with a pointer instead of
+    // being ignored or silently reinterpreted.
+    const std::vector<std::pair<const char*, Json>> aliases = {
         {"grammar", "root ::= \"yes\" | \"no\""},
-        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}}},
         {"guided_json", Json{{"type", "object"}}},
         {"guided_regex", "[a-z]+"},
         {"guided_choice", Json::array({"yes", "no"})},
-        {"guided_grammar", "root ::= \"yes\" | \"no\""},
+        {"guided_grammar", ""},
     };
-    for (const auto& [field, value] : active) {
+    for (const auto& [field, value] : aliases) {
         Json body            = base_request();
         body[field]          = value;
         const ApiError error = api_error([&] { (void)parse(body); });
-        failures +=
-            check(error.param == field && error.code == "constrained_decoding_not_supported" &&
-                      error.message.contains(field),
-                  std::string(field) + " constrained decoding is explicitly rejected");
+        failures += check(error.param == field && error.message.contains("structured_outputs"),
+                          std::string(field) + " alias is refused with a pointer");
     }
 
+    // A malformed object, and a grammar that cannot be combined with the request, are refused here
+    // rather than at generation time.
+    const std::vector<std::pair<const char*, Json>> malformed = {
+        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}}},
+        {"structured_outputs", Json{{"grammar", ""}}},
+        {"structured_outputs", Json{{"grammar", 1}}},
+        {"structured_outputs", Json{{"grammar", "root ::= \"a\""}, {"json", Json::object()}}},
+    };
+    for (const auto& [field, value] : malformed) {
+        Json body            = base_request();
+        body[field]          = value;
+        const ApiError error = api_error([&] { (void)parse(body); });
+        // A malformed object is refused at the object itself; a malformed or unknown value names
+        // the field it came from.
+        failures += check(error.param.starts_with("structured_outputs"),
+                          "malformed structured_outputs is refused at its field");
+    }
+    Json with_tools    = base_request();
+    with_tools["tools"] = Json::array({Json{{"type", "function"},
+                                            {"function", Json{{"name", "weather"},
+                                                              {"parameters",
+                                                               Json{{"type", "object"}}}}}}});
+    with_tools["structured_outputs"] = Json{{"grammar", "root ::= \"a\""}};
+    failures += check(api_error([&] { (void)parse(with_tools); }).param ==
+                          "structured_outputs.grammar",
+                      "a grammar with active tools is refused before generation");
+    Json with_stop       = base_request();
+    with_stop["stop"]    = "END";
+    with_stop["structured_outputs"] = Json{{"grammar", "root ::= \"a\""}};
+    failures += check(api_error([&] { (void)parse(with_stop); }).param ==
+                          "structured_outputs.grammar",
+                      "a grammar with a custom stop is refused before generation");
+
+    // Null values stay neutral, so clients that always send the field remain harmless.
     Json neutral                  = base_request();
-    neutral["grammar"]            = "";
     neutral["structured_outputs"] = nullptr;
     neutral["guided_json"]        = nullptr;
     neutral["guided_regex"]       = nullptr;
     neutral["guided_choice"]      = nullptr;
     neutral["guided_grammar"]     = nullptr;
-    failures += check(parse(neutral).generation.messages.size() == 1,
+    failures += check(parse(neutral).generation.messages.size() == 1 &&
+                          !parse(neutral).generation.constraint,
                       "neutral constrained-decoding extension values are accepted");
     return failures;
 }
@@ -245,16 +351,18 @@ int test_tools() {
     body["tool_choice"]          = "none";
     body["parallel_tool_calls"]  = false;
     const OpenAIChatRequest none = parse(body);
-    failures +=
-        check(!none.generation.uses_tools() && prompt(none.generation).options.tool_jsons.empty(),
-              "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
+    failures += check(!none.generation.uses_tools() &&
+                          prompt(none.generation).options.tool_jsons.size() == 1,
+                      "tool_choice none keeps declarations in the prompt");
 
     body["tool_choice"] = "required";
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
-                      "required tool choice rejected");
+    failures += check(parse(body).generation.tool_choice.mode == ToolChoiceMode::Required,
+                      "required choice reaches generation");
     body["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
-    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
-                      "named tool choice rejected");
+    failures += check(parse(body).generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"weather"} &&
+                          !parse(body).generation.tool_choice.parallel,
+                      "named choice selects exactly one invocation");
 
     body          = base_request();
     body["tools"] = Json::array({function_tool(), function_tool("search")});
@@ -264,23 +372,23 @@ int test_tools() {
               Json{{"mode", "auto"},
                    {"tools", Json::array({Json{{"type", "function"}, {"name", "search"}}})}}}};
     const GenerationRequest allowed = parse(body).generation;
-    failures += check(allowed.tools.size() == 1 && allowed.tools[0].name == "search" &&
-                          prompt(allowed).options.tool_jsons.size() == 1,
-                      "allowed_tools auto narrows the executable function set");
+    failures += check(allowed.tools.size() == 2 &&
+                          allowed.tool_choice.allowed_names == std::vector<std::string>{"search"} &&
+                          prompt(allowed).options.tool_jsons.size() == 2,
+                      "allowed_tools preserves declarations and selects callable names");
 
     body["tool_choice"] =
         Json{{"type", "allowed_tools"},
              {"mode", "auto"},
              {"tools", Json::array({Json{{"type", "function"}, {"name", "weather"}}})}};
     const GenerationRequest direct_allowed = parse(body).generation;
-    failures += check(direct_allowed.tools.size() == 1 && direct_allowed.tools[0].name == "weather",
+    failures += check(direct_allowed.tools.size() == 2 &&
+                          direct_allowed.tool_choice.allowed_names ==
+                              std::vector<std::string>{"weather"},
                       "direct allowed_tools compatibility shape is accepted");
-    body["tool_choice"]["mode"]     = "required";
-    const ApiError required_allowed = api_error([&] { (void)parse(body); });
-    failures +=
-        check(required_allowed.code == "tool_choice_not_supported" &&
-                  required_allowed.message.contains("at least one tool call"),
-              "required allowed_tools reports the unenforceable guarantee");
+    body["tool_choice"]["mode"] = "required";
+    failures += check(parse(body).generation.tool_choice.mode == ToolChoiceMode::Required,
+                      "allowed_tools required reaches generation");
     body["tool_choice"]["mode"]             = "auto";
     body["tool_choice"]["tools"][0]["name"] = "missing";
     failures += check(api_error([&] { (void)parse(body); }).param == "tool_choice",
@@ -288,8 +396,11 @@ int test_tools() {
 
     body          = base_request();
     body["tools"] = Json::array({function_tool("weather", true)});
-    failures += check(api_error([&] { (void)parse(body); }).code == "strict_tools_not_supported",
-                      "strict tools rejected");
+    failures += check(
+        parse(body).generation.tools[0].strict &&
+            Json::parse(
+                prompt(parse(body).generation).options.tool_jsons[0])["function"]["strict"] == true,
+        "strict survives prompt and request translation");
     body["tools"] = Json::array({Json{{"type", "custom"}, {"name", "shell"}}});
     failures += check(api_error([&] { (void)parse(body); }).code == "tool_type_not_supported",
                       "custom tools rejected");
@@ -297,9 +408,8 @@ int test_tools() {
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
     body["parallel_tool_calls"] = false;
-    failures +=
-        check(api_error([&] { (void)parse(body); }).code == "parallel_tool_calls_not_supported",
-              "parallel_tool_calls=false rejected when tools exist");
+    failures += check(!parse(body).generation.tool_choice.parallel,
+                      "parallel_tool_calls=false reaches generation");
     body.erase("tools");
     failures += check(parse(body).generation.tools.empty(),
                       "parallel_tool_calls=false is neutral without tools");
@@ -841,6 +951,29 @@ int test_common_objects() {
     return failures;
 }
 
+int test_leading_instruction_shared_prefix() {
+    int failures     = 0;
+    Json body        = base_request();
+    body["messages"] = Json::array({
+        Json{{"role", "system"}, {"content", "you are an agent"}},
+        Json{{"role", "developer"}, {"content", "tools available"}},
+        Json{{"role", "user"}, {"content", "go"}},
+    });
+    const GenerationRequest request = parse(body).generation;
+    failures += check(request.messages[1].cache_boundary_after.has_value() &&
+                          request.messages[1].cache_boundary_after->evidence ==
+                              ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                      "leading system/developer frontier did not publish a shared-prefix candidate");
+    failures += check(!request.messages[0].cache_boundary_after.has_value(),
+                      "a non-final leading instruction turn was marked");
+
+    const GenerationRequest disabled =
+        parse_chat_completion_request(body, limits(), false).generation;
+    failures += check(!disabled.messages[1].cache_boundary_after.has_value(),
+                      "--no-auto-system-shared-prefix left the frontier candidate in place");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -850,6 +983,7 @@ int main() {
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
     failures += test_messages_and_media();
+    failures += test_leading_instruction_shared_prefix();
     failures += test_reasoning_and_extensions();
     failures += test_stops_and_ranges();
     failures += test_aggregate_response();
