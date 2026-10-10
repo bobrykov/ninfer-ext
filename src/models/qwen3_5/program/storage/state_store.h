@@ -141,6 +141,68 @@ public:
         return host_ == nullptr ? 0U : host_->occupied();
     }
 
+    /// Point-in-time composition of the StateImage fleet for diagnostics.
+    ///
+    /// The struct counts live objects by role and residency and reports the
+    /// oldest and newest content epochs among them. Epochs come from a
+    /// monotonically increasing counter, so the spread between the two is a
+    /// proxy for how long the stalest retained image has been alive; a wide
+    /// spread next to a full device occupancy is the signature of an anchor
+    /// fleet that accumulates without retirement.
+    struct FleetSummary {
+        /// Number of live objects carrying the ActiveMutable role.
+        std::uint32_t active_mutable = 0;
+        /// Number of live objects carrying the CheckpointImmutable role.
+        std::uint32_t checkpoint_immutable = 0;
+        /// Number of live objects carrying the ReservedDestination role.
+        std::uint32_t reserved_destination = 0;
+        /// Live objects with a device slot currently attached.
+        std::uint32_t device_resident = 0;
+        /// Live objects with a host slot currently attached.
+        std::uint32_t host_resident = 0;
+        /// Content epoch of the oldest live object, zero when empty.
+        std::uint64_t oldest_epoch = 0;
+        /// Content epoch of the newest live object, zero when empty.
+        std::uint64_t newest_epoch = 0;
+        /// Total live objects across every role.
+        std::uint32_t occupied = 0;
+        /// Device slots currently attached to live objects.
+        std::uint32_t device_occupied_slots = 0;
+        /// Total device slots the store can ever attach.
+        std::uint32_t device_total_slots = 0;
+    };
+
+    /// Summarise the current StateImage fleet composition.
+    ///
+    /// The walk is a read-only pass over the object table and never mutates
+    /// allocator state, so it is safe to call from decline logging or any
+    /// other diagnostic path. Free objects are skipped; an empty store
+    /// reports zeroed counts and epochs.
+    [[nodiscard]] FleetSummary fleet_summary() const noexcept {
+        FleetSummary summary;
+        summary.device_occupied_slots = device_occupied();
+        summary.device_total_slots   = device_capacity();
+        for (const Object& object : objects_) {
+            if (object.role == StateImageRole::Free) { continue; }
+            switch (object.role) {
+            case StateImageRole::ActiveMutable: ++summary.active_mutable; break;
+            case StateImageRole::CheckpointImmutable: ++summary.checkpoint_immutable; break;
+            case StateImageRole::ReservedDestination: ++summary.reserved_destination; break;
+            case StateImageRole::Free: break;
+            }
+            if (object.device_slot) { ++summary.device_resident; }
+            if (object.host_slot) { ++summary.host_resident; }
+            if (summary.oldest_epoch == 0 || object.content_epoch < summary.oldest_epoch) {
+                summary.oldest_epoch = object.content_epoch;
+            }
+            if (object.content_epoch > summary.newest_epoch) {
+                summary.newest_epoch = object.content_epoch;
+            }
+            ++summary.occupied;
+        }
+        return summary;
+    }
+
     [[nodiscard]] std::optional<StateImageHandle> reserve_destination() noexcept {
         return allocate(StateImageRole::ReservedDestination, true);
     }

@@ -546,6 +546,27 @@ bool ProgramImpl::physical_peak_fits(detail::PhysicalResources peak) const noexc
                      occupied.host.state_slots, peak.host.state_slots,
                      limits.host.state_slots,
                      occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+        // The state dimension is the one operators cannot introspect from the
+        // occupancy counters alone: identical "full" readings can hide either
+        // a fresh working set or a stale fleet that never retired. Emit the
+        // role mix and the epoch spread so the two cases are distinguishable
+        // in the log without a debugger.
+        const bool state_binds =
+            occupied.device.state_slots > limits.device.state_slots ||
+            peak.device.state_slots > limits.device.state_slots - occupied.device.state_slots;
+        if (state_binds && state_store != nullptr) {
+            const StateImageStore::FleetSummary fleet = state_store->fleet_summary();
+            std::fprintf(stderr,
+                         "[peak-decline:state-fleet] live %u/%u "
+                         "roles act=%u ckpt=%u rsv=%u resid dev=%u host=%u "
+                         "slots %u/%u epochs %lu..%lu\n",
+                         fleet.occupied, state_store->capacity(),
+                         fleet.active_mutable, fleet.checkpoint_immutable,
+                         fleet.reserved_destination, fleet.device_resident,
+                         fleet.host_resident, fleet.device_occupied_slots,
+                         fleet.device_total_slots, static_cast<unsigned long>(fleet.oldest_epoch),
+                         static_cast<unsigned long>(fleet.newest_epoch));
+        }
     }
     return fits;
 }
