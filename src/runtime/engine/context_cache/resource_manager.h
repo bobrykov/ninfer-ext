@@ -316,6 +316,25 @@ public:
                     idle.emplace_back(entry.last_touch_epoch, slot);
                 }
             }
+            // Recency guard on top of the depth-ranked keep-set: after a client
+            // compaction the freshly published resume points are the SHALLOWEST
+            // entries in the catalog (the compacted base is small), so a purely
+            // depth-ranked prune releases exactly the checkpoints the client is
+            // about to resume from — observed live as "published MTP checkpoint
+            // is not materializable" failures. Entries touched within the
+            // newest few epochs are the client's active handoff candidates and
+            // stay pinned regardless of depth.
+            constexpr std::size_t kProtectRecentCount = 3;
+            if (idle.size() > kProtectRecentCount) {
+                std::vector<std::uint64_t> epochs;
+                epochs.reserve(idle.size());
+                for (const auto& [epoch, slot] : idle) { (void)slot; epochs.push_back(epoch); }
+                std::sort(epochs.begin(), epochs.end(), std::greater<std::uint64_t>{});
+                const std::uint64_t recent_floor = epochs[kProtectRecentCount - 1];
+                std::erase_if(idle, [&](const auto& candidate) {
+                    return candidate.first >= recent_floor;
+                });
+            }
             constexpr std::size_t kKeepFreshest = 4;  // endpoint + sibling-duplicate + spare + one anchor-bearing elder
             // Address-pool pressure: the publication catalog (above) and the program's KV
             // address-space descriptor pool (14) are separate resources. Retained
