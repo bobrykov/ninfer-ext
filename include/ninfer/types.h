@@ -688,6 +688,22 @@ private:
     RequestErrorSource source_;
 };
 
+/// Capacity exhaustion somewhere in the context-cache machinery.
+///
+/// Thrown by the program layer when a request's mandatory context work
+/// cannot proceed because a finite runtime resource is fully occupied —
+/// state-image slots, KV address-space descriptors, or admission peaks —
+/// as opposed to an invariant violation, which keeps raising
+/// `std::logic_error`. The engine's admission path translates this type
+/// into `RequestErrorKind::Unavailable` so clients receive a retryable
+/// 503 ("temporarily pinned, retry shortly") instead of a fatal 500.
+class ContextCapacityError final : public std::runtime_error {
+public:
+    /// Carries the resource-specific description for the client response.
+    explicit ContextCapacityError(std::string message)
+        : std::runtime_error(std::move(message)) {}
+};
+
 struct PromptSummary {
     bool starts_in_reasoning    = false;
     std::uint32_t prompt_tokens = 0;

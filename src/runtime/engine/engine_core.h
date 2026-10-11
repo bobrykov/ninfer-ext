@@ -1553,6 +1553,35 @@ private:
                                   !request->force_plain_prefill);
     }
 
+    /// Reclassify admission exceptions into retryable request errors.
+    ///
+    /// Base-plan construction and admission inspection may throw either a
+    /// classified `RequestError` (passed through untouched), a
+    /// `ContextCapacityError` marking finite-resource exhaustion, or an
+    /// unknown exception. Capacity exhaustion is translated to
+    /// `RequestErrorKind::Unavailable` so the client sees a retryable 503
+    /// instead of a fatal 500 while everything else keeps its original
+    /// classification; the function never throws.
+    [[nodiscard]] static std::exception_ptr
+    translate_admission_exception(std::exception_ptr error) noexcept {
+        if (!error) { return error; }
+        try {
+            std::rethrow_exception(error);
+        } catch (RequestError&) {
+            return error;
+        } catch (ninfer::ContextCapacityError& capacity) {
+            try {
+                return std::make_exception_ptr(RequestError(
+                    RequestErrorKind::Unavailable,
+                    std::string("context capacity temporarily exhausted: ") + capacity.what()));
+            } catch (...) {
+                return error;
+            }
+        } catch (...) {
+            return error;
+        }
+    }
+
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
                                                          std::exception_ptr error) {
         if (!erase_pending(request)) { return AdmissionProgress::None; }
@@ -1821,7 +1850,8 @@ private:
             try {
                 ensure_base_plan(head);
             } catch (...) {
-                (void)remove_pending_error(head, std::current_exception());
+                (void)remove_pending_error(head, translate_admission_exception(
+                                                    std::current_exception()));
                 control_progress = true;
                 continue;
             }
@@ -1834,7 +1864,8 @@ private:
             try {
                 head_inspection.emplace(inspect_admission(head, allowance));
             } catch (...) {
-                (void)remove_pending_error(head, std::current_exception());
+                (void)remove_pending_error(head, translate_admission_exception(
+                                                    std::current_exception()));
                 control_progress = true;
                 continue;
             }

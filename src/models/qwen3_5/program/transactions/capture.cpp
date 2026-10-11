@@ -728,14 +728,15 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
         }
         transaction.active_text_destination = text_kv_addresses->create_inactive();
         if (!transaction.active_text_destination) {
-            throw std::logic_error("selected capture has no Text KV address descriptor");
+            throw ninfer::ContextCapacityError("Text KV descriptor pool is exhausted for capture");
         }
         transaction.text_snapshot.emplace(text_kv_addresses->prepare_active_snapshot(
             sequence.kv->text, *transaction.active_text_destination, sequence.text_kv_valid));
         if (sequence.kv->backend) {
             transaction.active_backend_destination = backend_kv_addresses->create_inactive();
             if (!transaction.active_backend_destination) {
-                throw std::logic_error("selected capture has no Backend KV address descriptor");
+                throw ninfer::ContextCapacityError(
+                    "Backend KV descriptor pool is exhausted for capture");
             }
             transaction.backend_snapshot.emplace(backend_kv_addresses->prepare_active_snapshot(
                 *sequence.kv->backend, *transaction.active_backend_destination,

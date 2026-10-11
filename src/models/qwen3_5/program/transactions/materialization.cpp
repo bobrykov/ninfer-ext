@@ -732,19 +732,20 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
         if (retained_source || details.text_prefix_fork_required) {
             transaction.root_text_address = text_kv_addresses->create_inactive();
             if (!transaction.root_text_address) {
-                throw std::logic_error("Text KV prefix-fork destination is unavailable");
+                throw ninfer::ContextCapacityError("Text KV prefix-fork descriptor pool is exhausted");
             }
         }
         if (backend_address && (retained_source || details.backend_prefix_fork_required)) {
             transaction.root_backend_address = backend_kv_addresses->create_inactive();
             if (!transaction.root_backend_address) {
-                throw std::logic_error("Backend KV prefix-fork destination is unavailable");
+                throw ninfer::ContextCapacityError(
+                    "Backend KV prefix-fork descriptor pool is exhausted");
             }
         }
     } else {
         transaction.root_text_address = text_kv_addresses->create_inactive();
         if (!transaction.root_text_address) {
-            throw std::logic_error("root Text KV address descriptor is unavailable");
+            throw ninfer::ContextCapacityError("root Text KV descriptor pool is exhausted");
         }
         text_address = *transaction.root_text_address;
         if (details.backend_kv_page_entitlement != 0) {
@@ -753,7 +754,7 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             }
             transaction.root_backend_address = backend_kv_addresses->create_inactive();
             if (!transaction.root_backend_address) {
-                throw std::logic_error("root Backend KV address descriptor is unavailable");
+                throw ninfer::ContextCapacityError("root Backend KV descriptor pool is exhausted");
             }
             backend_address = *transaction.root_backend_address;
         }
