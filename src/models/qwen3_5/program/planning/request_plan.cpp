@@ -597,7 +597,12 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             ((source != nullptr && source->mtp_kv_valid >= plan->reuse_base - 1) ||
              (shared_source != nullptr && shared_source->backend_frontier >= plan->reuse_base - 1));
         if (plan->reuse != ReusePath::Root && !append_ready && !checkpoint_ready) {
-            throw std::logic_error("published MTP checkpoint is not materializable");
+            // The slot-prune path releases idle continuations, so a published
+            // checkpoint the client still names can lose its MTP state image
+            // between turns. That is a runtime-state miss, not an invariant
+            // violation: degrade to the shared-prefix/rebuild path exactly as a
+            // prefix mismatch does, instead of failing the request with a 500.
+            return std::nullopt;
         }
     }
 
@@ -611,7 +616,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
          (shared_source != nullptr &&
           (!shared_source->kv || (backend_kv_cache() && !shared_source->kv->backend) ||
            shared_source->frontier < plan->reuse_base)))) {
-        throw std::logic_error("published DFlash checkpoint is not materializable");
+        // Same degradation as the MTP case above: a pruned DFlash sidecar must
+        // rebuild rather than kill the request.
+        return std::nullopt;
     }
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
