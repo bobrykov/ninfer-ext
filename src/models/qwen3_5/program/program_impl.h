@@ -1444,6 +1444,15 @@ private:
     [[nodiscard]] bool stream_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,
                                  KVAddressSpaceHandle address, std::uint32_t tokens,
                                  RequestControl& owner);
+    // Demotes Device pages of cold catalogued continuations to their Host replicas until the
+    // Device pools can satisfy `target_free_pages` available pages.
+    //
+    // Stale fleet anchors keep whole KV generations Device-resident while the client may never
+    // resume from them, which is the page-side half of the anchor-economy over-pinning. This pass
+    // picks catalogued continuations with published endpoints, oldest state image first, skips
+    // the freshest few (the client's active handoff points), and streams their pages to Host —
+    // the anchors stay alive and resume through the existing Host-to-Device recovery path.
+    std::uint32_t demote_cold_fleet_kv(std::uint32_t target_free_pages, RequestControl& owner);
     // Demotes up to `count` of the oldest demotable pages of `address` in runs of at least
     // `group` where possible; returns how many left the Device.
     std::uint32_t demote_oldest_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addresses,

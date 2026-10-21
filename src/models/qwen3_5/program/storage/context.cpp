@@ -1747,6 +1747,78 @@ bool ProgramImpl::stream_kv(LogicalKVPageStore& pages, KVAddressSpaceStore& addr
                             detail::kKVStreamGroupPages, owner) >= needed - coverage;
 }
 
+std::uint32_t ProgramImpl::demote_cold_fleet_kv(std::uint32_t target_free_pages,
+                                                RequestControl& owner) {
+    if (!kv_stream || target_free_pages == 0 || !text_kv_pages || !text_kv_addresses ||
+        !state_store) {
+        return 0;
+    }
+    struct Candidate {
+        /// Continuation slot index holding the catalogued anchor.
+        std::uint32_t slot;
+        /// Content epoch of the anchor's endpoint image; older demotes first.
+        std::uint64_t epoch;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(continuation_capacity);
+    for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
+        const ContinuationSlot& slot      = continuation_slots[index];
+        const SequenceState&    sequence  = continuation_states[index];
+        if (slot.role != ContinuationSlotRole::Catalogued || !sequence.kv ||
+            !sequence.endpoint_valid || sequence.state.fork_pending) {
+            continue;
+        }
+        if (!state_store->valid(sequence.state.read)) { continue; }
+        candidates.push_back(
+            Candidate{index, state_store->content_epoch(sequence.state.read)});
+    }
+    // The freshest few anchors are the client's live handoff points (post-compaction resume
+    // bases are always fresh and shallow); demoting them would tax the next turn. Everything
+    // older is fair game, oldest first.
+    constexpr std::size_t  kProtectRecent           = 3;
+    constexpr std::uint32_t kMaxContinuationsPerPass = 8;
+    constexpr std::uint32_t kDemoteGroup             = 4;
+    if (candidates.size() <= kProtectRecent) { return 0; }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& left, const Candidate& right) {
+                  return left.epoch < right.epoch;
+              });
+    const auto pool_relief_reached = [&] {
+        const bool text_ok =
+            text_kv_pages->physical_pool().available_pages() >= target_free_pages;
+        const bool backend_ok =
+            !backend_kv_pages || backend_kv_pages->physical_pool().available_pages() >=
+                                     std::min(target_free_pages, std::uint32_t{64});
+        return text_ok && backend_ok;
+    };
+    std::uint32_t demoted_total   = 0;
+    std::uint32_t demoted_slots   = 0;
+    for (std::size_t position = 0; position + kProtectRecent < candidates.size(); ++position) {
+        if (pool_relief_reached() || demoted_slots >= kMaxContinuationsPerPass) { break; }
+        SequenceState& sequence = continuation_states[candidates[position].slot];
+        const std::uint32_t text_pages = text_kv_addresses->entitlement(sequence.kv->text);
+        demoted_total += demote_oldest_kv(*text_kv_pages, *text_kv_addresses,
+                                          sequence.kv->text, text_pages, kDemoteGroup, owner);
+        if (sequence.kv->backend && backend_kv_pages && backend_kv_addresses) {
+            const std::uint32_t backend_pages =
+                backend_kv_addresses->entitlement(*sequence.kv->backend);
+            demoted_total += demote_oldest_kv(*backend_kv_pages, *backend_kv_addresses,
+                                              *sequence.kv->backend, backend_pages,
+                                              kDemoteGroup, owner);
+        }
+        ++demoted_slots;
+    }
+    if (demoted_total != 0) {
+        std::fprintf(stderr,
+                     "[fleet-stream] demoted %u Device pages from %u cold continuations to "
+                     "Host | text pool available %u/%u\n",
+                     demoted_total, demoted_slots,
+                     text_kv_pages->physical_pool().available_pages(),
+                     text_kv_pages->physical_pool().capacity_pages());
+    }
+    return demoted_total;
+}
+
 std::uint32_t ProgramImpl::demote_oldest_kv(LogicalKVPageStore& pages,
                                             KVAddressSpaceStore& addresses,
                                             KVAddressSpaceHandle address, std::uint32_t count,
@@ -1956,17 +2028,38 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
     maybe_audit_page_pools();
     // Prefill maps each chunk against the admission window; streaming makes room for it. Host KV
     // is not reserved at admission, so a full arena fails the step as a capacity shortfall.
-    if (kv_stream &&
-        (!stream_kv(*text_kv_pages, *text_kv_addresses, sequence.kv->text, main_tokens,
+    if (kv_stream) {
+        // Cold-fleet retirement (anchor-economy page fix): stale catalogued anchors hold whole
+        // Device-resident generations the client may never resume from. Before the active
+        // mapping streams its own tail, demote those generations to Host so the Device pool
+        // relief comes from dead weight first, not from the live request's working set.
+        // The relief target is a fraction of pool capacity, not just the chunk's need: a
+        // chunk-sized target only fires near total exhaustion, letting dead anchors pin the
+        // pool for whole sessions (observed as a 13-minute rebuild at 221 tok/s effective
+        // while the fleet held ~40% of pages). Keeping a standing headroom cleans the fleet
+        // early and keeps rebuilds fast.
+        constexpr std::uint32_t kReliefHeadroomPercent = 15;
+        const std::uint32_t needed_pages =
+            kv_pages_for_tokens(std::max(main_tokens, backend_tokens));
+        const std::uint32_t capacity_pages = text_kv_pages->physical_pool().capacity_pages();
+        const std::uint32_t headroom_pages =
+            capacity_pages / 100U * kReliefHeadroomPercent;
+        const std::uint32_t relief_target =
+            std::max(needed_pages + needed_pages / 2U + 8U, headroom_pages);
+        if (text_kv_pages->physical_pool().available_pages() < relief_target) {
+            (void)demote_cold_fleet_kv(relief_target, requests[sequence.lane]);
+        }
+        if (!stream_kv(*text_kv_pages, *text_kv_addresses, sequence.kv->text, main_tokens,
                     requests[sequence.lane]) ||
          (backend_tokens != 0 && !stream_kv(*backend_kv_pages, *backend_kv_addresses,
                                             *sequence.kv->backend, backend_tokens,
-                                            requests[sequence.lane])))) {
+                                            requests[sequence.lane]))) {
         std::fprintf(stderr,
                      "warning: KV streaming cannot map lane %u to %u tokens (backend %u): Host KV "
                      "capacity is exhausted\n",
                      sequence.lane, main_tokens, backend_tokens);
         throw std::bad_alloc();
+        }
     }
     text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
     if (backend_tokens != 0) {
