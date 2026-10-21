@@ -324,6 +324,8 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity        = cli.kv_capacity;
         engine_options.expert_cache       = cli.expert_cache;
         engine_options.ngram_residency    = cli.ngram_residency;
+        engine_options.ngram_cache_bytes  =
+            static_cast<std::size_t>(cli.ngram_cache_mib) * 1024ULL * 1024ULL;
         engine_options.prefill_chunk      = cli.prefill_chunk;
         engine_options.kv_cache           = cli.kv_cache;
         engine_options.speculative        = cli.speculative;

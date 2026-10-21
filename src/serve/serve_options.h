@@ -33,6 +33,7 @@ struct ServeOptions {
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     ExpertCachePolicy expert_cache;
     NgramResidency ngram_residency = NgramResidency::Automatic;
+    std::uint32_t ngram_cache_mib   = 0;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

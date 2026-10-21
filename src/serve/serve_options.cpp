@@ -75,7 +75,7 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--profile FILE] [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--expert-cache auto|MiB] "
-           "[--ngram-residency auto|mapped|stream] "
+           "[--ngram-residency auto|mapped|stream] [--ngram-cache-mib N] "
            "[--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--idle-prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
@@ -123,6 +123,8 @@ std::string serve_usage_text(const char* argv0) {
            "(Qwen4Exp); auto gives it the device memory left after the KV floor\n"
            "       --ngram-residency reads the Qwen4Exp n-gram table through the page cache "
            "(mapped) or with batched direct I/O (stream); auto maps it when host memory allows\n"
+           "       --ngram-cache-mib retains that many MiB of already-read n-gram pages when "
+           "streaming them; 0 disables retention\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --kv-stream lets --kv-capacity be below --max-context: each request owns an equal "
            "share, borrows idle shares, and moves older full pages to Host KV (--host-kv-mib) "
@@ -234,6 +236,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--ngram-residency") {
             options.ngram_residency =
                 product::parse_ngram_residency(require_value("--ngram-residency"));
+        } else if (arg == "--ngram-cache-mib") {
+            options.ngram_cache_mib = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--ngram-cache-mib"), "ngram-cache-mib"));
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));

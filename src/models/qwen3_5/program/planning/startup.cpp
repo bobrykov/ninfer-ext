@@ -1514,6 +1514,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_storage          = inputs.kv_storage;
     impl->expert_cache_slots  = inputs.expert_cache_slots;
     impl->ngram_stream        = inputs.ngram_stream;
+    impl->ngram_cache_bytes   = inputs.ngram_cache_bytes;
     impl->kv_stream           = inputs.kv_stream;
     impl->plain_mtp_batches =
         inputs.speculative_backend == SpeculativeBackend::Mtp && !inputs.causal_scoring &&
@@ -1753,6 +1754,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         inputs.expert_cache_slots =
             resolve_expert_cache_slots(inputs, options, floor_pages, maximum_pages);
         inputs.ngram_stream       = resolve_ngram_stream(parameters, options.ngram_residency);
+        inputs.ngram_cache_bytes  = options.ngram_cache_bytes;
     }
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();

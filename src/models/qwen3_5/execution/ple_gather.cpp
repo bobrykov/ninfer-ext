@@ -60,7 +60,8 @@ std::uint16_t float_to_bf16(float value) {
 
 } // namespace
 
-PleGather::PleGather(const PleTable& table, const PleConfig& config, bool stream)
+PleGather::PleGather(const PleTable& table, const PleConfig& config, bool stream,
+                     std::size_t cache_bytes)
     : table_(table), config_(config), width_(config.embed_dim), row_width_(config.row_width()) {
     if (config.ngram_size < 2 || config.ngram_size > kMaximumNgram ||
         config.multipliers.size() != config.ngram_size ||
@@ -91,10 +92,15 @@ PleGather::PleGather(const PleTable& table, const PleConfig& config, bool stream
         e4m3_[static_cast<std::size_t>(code)] = e4m3fn(static_cast<std::uint8_t>(code));
     }
     if (config.heads() > 32) { throw std::invalid_argument("PLE gather supports 32 heads"); }
-    if (stream) { reader_ = std::make_unique<PleRowReader>(table.segments); }
+    if (stream) {
+        reader_ = std::make_unique<PleRowReader>(
+            table.segments, static_cast<std::size_t>(cache_bytes / PleRowReader::kPage));
+    }
 }
 
 PleGather::~PleGather() = default;
+
+bool PleGather::retains() const noexcept { return reader_ != nullptr && reader_->retains(); }
 
 const std::byte* PleGather::locate(std::uint64_t object_offset, std::uint64_t bytes) const {
     const auto it =
@@ -174,6 +180,17 @@ void PleGather::decode_row(const std::byte* codes, const std::byte* scale_bytes,
     }
 }
 
+void PleGather::row_ranges(std::span<const std::uint64_t> rows,
+                           std::vector<PleRowReader::Range>& out) const {
+    out.resize(2 * rows.size());
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        out[2 * r]     = {rows[r] * table_.row_bytes,
+                          static_cast<std::uint32_t>(table_.row_bytes)};
+        out[2 * r + 1] = {table_.scale_plane + rows[r] * table_.scale_row_bytes,
+                          static_cast<std::uint32_t>(table_.scale_row_bytes)};
+    }
+}
+
 void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, std::size_t count,
                        std::span<std::uint16_t> out) {
     if (first > tokens.size() || count > tokens.size() - first ||
@@ -186,13 +203,8 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
         column_rows(tokens, first + i, std::span<std::uint64_t>(rows.data() + i * heads, heads));
     }
     if (reader_) {
-        std::vector<PleRowReader::Range> ranges(2 * rows.size());
-        for (std::size_t r = 0; r < rows.size(); ++r) {
-            ranges[2 * r] = {rows[r] * table_.row_bytes,
-                             static_cast<std::uint32_t>(table_.row_bytes)};
-            ranges[2 * r + 1] = {table_.scale_plane + rows[r] * table_.scale_row_bytes,
-                                 static_cast<std::uint32_t>(table_.scale_row_bytes)};
-        }
+        std::vector<PleRowReader::Range> ranges;
+        row_ranges(rows, ranges);
         reader_->read(ranges);
     }
     const auto decode = [&](std::size_t begin, std::size_t end) {
@@ -227,6 +239,22 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
         threads.emplace_back([&, begin, end] { decode(begin, end); });
     }
     decode(0, std::min(count, share));
+}
+
+void PleGather::prefetch(std::span<const std::int32_t> tokens, std::size_t first,
+                         std::size_t count) {
+    if (reader_ == nullptr || !reader_->retains()) { return; }
+    if (first > tokens.size() || count > tokens.size() - first) {
+        throw std::invalid_argument("PLE prefetch range is invalid");
+    }
+    const std::uint32_t heads = config_.heads();
+    std::vector<std::uint64_t> rows(count * heads);
+    for (std::size_t i = 0; i < count; ++i) {
+        column_rows(tokens, first + i, std::span<std::uint64_t>(rows.data() + i * heads, heads));
+    }
+    std::vector<PleRowReader::Range> ranges;
+    row_ranges(rows, ranges);
+    reader_->prefetch(ranges);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

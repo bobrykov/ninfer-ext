@@ -4,6 +4,7 @@
 // pages and the second segment starts mid-page. Mapped decode is checked against an independent
 // reconstruction of the stored words.
 #include "models/qwen3_5/execution/ple_gather.h"
+#include "models/qwen3_5/execution/ple_rows.h"
 
 #include <cmath>
 #include <cstdint>
@@ -126,14 +127,20 @@ int run(bool grouped) {
     try {
         execution::PleGather mapped(table, config, false);
         execution::PleGather streamed(table, config, true);
-        failures += check(!mapped.streamed() && streamed.streamed(), "residency flag mismatch");
+        // A retention budget large enough for the whole table: caching must not change a word.
+        execution::PleGather cached(table, config, true,
+                                    static_cast<std::size_t>(execution::PleRowReader::kPage) * 64);
+        failures += check(!mapped.streamed() && streamed.streamed() && cached.streamed(),
+                          "residency flag mismatch");
         // A decode-sized call, a column after EOS, and a prefill-sized call.
         for (const auto [first, count] :
              {std::pair<std::size_t, std::size_t>{0, 1}, {6, 3}, {141, 1}, {10, 290}}) {
-            std::vector<std::uint16_t> a(count * config.embed_dim), b(a.size());
+            std::vector<std::uint16_t> a(count * config.embed_dim), b(a.size()), c(a.size());
             mapped.gather(tokens, first, count, a);
             streamed.gather(tokens, first, count, b);
+            cached.gather(tokens, first, count, c);
             failures += check(a == b, "streamed n-gram rows differ from mapped rows");
+            failures += check(a == c, "retained n-gram rows differ from mapped rows");
         }
         // Mapped decode is independently the stored words times their scale.
         std::vector<std::uint16_t> column(config.embed_dim);

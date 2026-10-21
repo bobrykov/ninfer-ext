@@ -233,6 +233,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP wi
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--expert-cache auto\|MiB` | device cache of host-resident routed experts (Qwen4Exp only) | `auto` |
 | `--ngram-residency auto\|mapped\|stream` | read the Qwen4Exp n-gram table through the page cache or with batched direct I/O | `auto` |
+| `--ngram-cache-mib N` | retain this many MiB of already-read n-gram pages with stream residency; 0 disables | `0` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `4096` for Qwen4Exp else `1024`; a lone request also takes the idle width, which for Qwen4Exp widens with the prompt ([serving](serving.md)) |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |

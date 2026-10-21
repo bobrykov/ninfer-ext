@@ -84,16 +84,16 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 // Flags a `ninfer_serve_profile` may carry that the one-shot CLI also understands. Serve-only
 // options (concurrency, prefix caching, host tiers) are dropped when a profile is loaded here.
 constexpr std::string_view kCliProfileFlags[] = {
-    "prompt",           "messages",         "chat-template",      "max-new",
-    "max-context",      "kv-capacity",      "expert-cache",       "ngram-residency",
-    "prefill-chunk",    "device",           "kv-dtype",           "spec",
-    "draft-tokens",     "lm-head-draft",    "fixed-draft",        "draft-tree",
-    "lookup-drafts",    "lookup-min-match", "raw-output",         "print-token-ids",
-    "no-thinking",      "thinking-budget",  "reasoning-effort",   "vision",
-    "no-cuda-graph",    "stop-token-id",    "stop",               "reasoning-stop",
-    "temperature",      "top-p",            "top-k",              "min-p",
-    "presence-penalty", "frequency-penalty", "seed",             "greedy",
-    "log-level",
+    "prompt",           "messages",          "chat-template",     "max-new",
+    "max-context",      "kv-capacity",       "expert-cache",      "ngram-residency",
+    "ngram-cache-mib",  "prefill-chunk",     "device",            "kv-dtype",
+    "spec",             "draft-tokens",      "lm-head-draft",     "fixed-draft",
+    "draft-tree",       "lookup-drafts",     "lookup-min-match",  "raw-output",
+    "print-token-ids",  "no-thinking",       "thinking-budget",   "reasoning-effort",
+    "vision",           "no-cuda-graph",     "stop-token-id",     "stop",
+    "reasoning-stop",   "temperature",       "top-p",             "top-k",
+    "min-p",            "presence-penalty",  "frequency-penalty", "seed",
+    "greedy",           "log-level",
 };
 
 std::vector<std::string> load_cli_profile(const std::string& path) {
@@ -121,6 +121,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--profile FILE]\n"
            "       [--device N] [--expert-cache auto|MiB] [--ngram-residency auto|mapped|stream]\n"
+           "       [--ngram-cache-mib N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec "
            "mtp|dflash|dflash2|eagle3 --draft-tokens N]\n"
            "       [--lm-head-draft] [--fixed-draft] [--draft-tree N]\n"
@@ -154,6 +155,8 @@ std::string usage_text(const char* argv0) {
            "auto gives it the device memory left after the KV floor.\n"
            "--ngram-residency reads the Qwen4Exp n-gram table through the page cache (mapped) or\n"
            "with batched direct I/O (stream); auto maps it when free host memory covers it.\n"
+           "--ngram-cache-mib retains that many MiB of already-read n-gram pages when streaming\n"
+           "them; 0 disables retention.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
@@ -229,6 +232,8 @@ Options parse_options(int argc, char** argv) {
             options.expert_cache = product::parse_expert_cache(value(arg));
         } else if (arg == "--ngram-residency") {
             options.ngram_residency = product::parse_ngram_residency(value(arg));
+        } else if (arg == "--ngram-cache-mib") {
+            options.ngram_cache_mib = parse_u32(value(arg), "ngram-cache-mib");
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {

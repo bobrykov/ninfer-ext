@@ -259,6 +259,9 @@ struct EngineOptions {
     bool kv_stream = false;
     ExpertCachePolicy expert_cache;
     NgramResidency ngram_residency = NgramResidency::Automatic;
+    // Bytes of already-read n-gram table pages (Qwen4Exp, stream residency) kept in RAM between
+    // gathers so repeated n-grams stop re-reading the volume; 0 disables retention.
+    std::size_t ngram_cache_bytes = 0;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

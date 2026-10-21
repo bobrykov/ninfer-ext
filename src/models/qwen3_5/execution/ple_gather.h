@@ -2,6 +2,7 @@
 
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/execution/ple_rows.h"
 
 #include <array>
 #include <cstddef>
@@ -19,8 +20,11 @@ class PleRowReader;
 class PleGather {
 public:
     // `stream` reads rows with batched direct I/O instead of faulting them through the mapping,
-    // so the table never occupies the page cache.
-    PleGather(const PleTable& table, const PleConfig& config, bool stream);
+    // so the table never occupies the page cache. `cache_bytes` then retains that many bytes of
+    // already-read pages between gathers, so repeated n-grams stop re-reading the volume; 0
+    // disables retention.
+    PleGather(const PleTable& table, const PleConfig& config, bool stream,
+              std::size_t cache_bytes = 0);
     ~PleGather();
 
     [[nodiscard]] bool streamed() const noexcept { return reader_ != nullptr; }
@@ -33,12 +37,23 @@ public:
     void gather(std::span<const std::int32_t> tokens, std::size_t first, std::size_t count,
                 std::span<std::uint16_t> out);
 
+    // Starts filling the retained-page cache for the rows `gather(tokens, first, count)` would
+    // read, on the reader's worker pool, without producing embedding columns; a following gather
+    // of the same window then finds its pages resident and only dequantizes. Row indices and
+    // ranges are computed synchronously on the calling thread (cheap); only the page reads run
+    // asynchronously. Advisory only — a gather never depends on it. No-op without streaming and
+    // retention.
+    void prefetch(std::span<const std::int32_t> tokens, std::size_t first, std::size_t count);
+
+    [[nodiscard]] bool retains() const noexcept;
+
     // Table rows of one position whose context tokens at distance 0..ngram_size-1 are `context`.
     void rows(std::span<const std::int64_t> context, std::span<std::uint64_t> out) const;
 
 private:
     void column_rows(std::span<const std::int32_t> tokens, std::size_t position,
                      std::span<std::uint64_t> rows) const;
+    void row_ranges(std::span<const std::uint64_t> rows, std::vector<PleRowReader::Range>& out) const;
     void decode_row(const std::byte* codes, const std::byte* scale, std::uint16_t* out) const;
     [[nodiscard]] const std::byte* locate(std::uint64_t object_offset, std::uint64_t bytes) const;
 

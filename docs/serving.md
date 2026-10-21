@@ -956,6 +956,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--expert-cache auto\|MiB` | device cache of host-resident routed experts (Qwen4Exp only); `auto` takes the memory left after the KV floor | `auto` |
 | `--ngram-residency auto\|mapped\|stream` | Qwen4Exp n-gram table through the page cache or batched direct I/O; `auto` maps it when host memory allows | `auto` |
+| `--ngram-cache-mib N` | MiB of already-read n-gram table pages kept in RAM between gathers under stream residency, so repeated n-grams stop re-reading the volume; 0 disables retention | `0` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |

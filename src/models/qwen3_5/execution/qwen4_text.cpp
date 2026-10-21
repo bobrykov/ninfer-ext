@@ -928,6 +928,25 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
         }
     }
 
+    // The next chunk's n-gram rows are a pure function of the prompt tokens, and this chunk's
+    // device work is fully submitted — start filling the retained-page cache for the next window
+    // now, so its gather only dequantizes. The window is a prediction (vision or a split frontier
+    // can trim the next chunk); a wrong guess costs a few extra cached pages, never a wrong row.
+    // A chunk that was itself capped by a split frontier predicts another small chunk next, so
+    // the prefetch window shrinks with it — otherwise every short resumed-session unit would
+    // classify and cache rows for a full-width window, amplifying row work many times over.
+    if (config_.ple && runtime.ple_gather != nullptr && runtime.ple_gather->retains()) {
+        const std::size_t consumed = static_cast<std::size_t>(prompt_t0) + static_cast<std::size_t>(len);
+        if (consumed < history.size()) {
+            const std::size_t window = split_rel > 0 && len == split_rel
+                                           ? std::min<std::size_t>(2 * static_cast<std::size_t>(len),
+                                                                  static_cast<std::size_t>(prefill_chunk_))
+                                           : static_cast<std::size_t>(prefill_chunk_);
+            runtime.ple_gather->prefetch(history, consumed,
+                                         std::min<std::size_t>(window, history.size() - consumed));
+        }
+    }
+
     prefill_split_frontier_ = -1;
     timing.begin_wait();
     ctx_.synchronize();

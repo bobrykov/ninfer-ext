@@ -328,8 +328,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         if (config.ple) {
             const auto& block = parameters.qwen4->layers.at(config.ple->layer);
             if (!block.ple) { throw std::logic_error("Qwen4Exp PLE layer has no parameters"); }
-            ple_gather = std::make_unique<execution::PleGather>(block.ple->table, *config.ple,
-                                                                plan.ngram_stream);
+            ple_gather = std::make_unique<execution::PleGather>(
+                block.ple->table, *config.ple, plan.ngram_stream, plan.ngram_cache_bytes);
             runtime.ple_states = state_images->ple_states();
             if (layout.ple_record) { runtime.ple_record = layout.ple_record->bind(backing); }
             if (layout.ple_input) { runtime.ple_input = layout.ple_input->bind(backing); }
