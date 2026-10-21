@@ -1223,13 +1223,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                         ? std::optional<std::uint32_t>(
                               staged.capture_groups[staged.next_capture].frontier)
                         : std::nullopt;
+                // Chunks split only where a capture is pending: the checkpoint tensor is armed
+                // exactly then, so a boundary no capture sits on executes no work — yet every
+                // extra split narrows a forward, and a narrow staged forward still streams all
+                // routed-expert layers (each ~68 GiB H2D), shattering multi-turn prompts into
+                // per-turn units. Rewrite checkpoints ride capture groups (add_capture merges
+                // them at planning), so dropping bare rewrite frontiers here loses no checkpoint.
                 std::optional<std::uint32_t> split_frontier = capture_frontier;
-                const auto rewrite_split                    = std::ranges::upper_bound(
-                    staged.prompt.identity.rewrite_execution_frontiers, staged.cursor);
-                if (rewrite_split != staged.prompt.identity.rewrite_execution_frontiers.end() &&
-                    (!split_frontier || *rewrite_split < *split_frontier)) {
-                    split_frontier = *rewrite_split;
-                }
                 execution::PrefillChunkResult result;
                 timing.pause();
                 if (staged.vision) {
